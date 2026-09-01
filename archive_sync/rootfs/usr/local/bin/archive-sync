@@ -51,13 +51,28 @@ while :; do
     printf 'downloading %s\n' "$logical_path"
     curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary" \
       || fail download "$logical_path"
-    actual_size="$(stat -c '%s' "$temporary")"
-    [[ "$actual_size" == "$size_bytes" ]] || { rm -f "$temporary"; fail size "$logical_path"; }
-    if [[ -n "$content_hash" ]]; then
-      actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"
-      [[ "$actual_hash" == "$content_hash" ]] || { rm -f "$temporary"; fail hash "$logical_path"; }
+    if ! actual_size="$(stat -c '%s' "$temporary")"; then
+      rm -f "$temporary"
+      fail size "cannot stat $logical_path"
     fi
-    mv -f "$temporary" "$destination"
+    if [[ "$actual_size" != "$size_bytes" ]]; then
+      rm -f "$temporary"
+      fail size "$logical_path (expected $size_bytes, got $actual_size)"
+    fi
+    if [[ -n "$content_hash" ]]; then
+      if ! actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"; then
+        rm -f "$temporary"
+        fail hash "cannot hash $logical_path"
+      fi
+      if [[ "$actual_hash" != "$content_hash" ]]; then
+        rm -f "$temporary"
+        fail hash "$logical_path (expected $content_hash, got $actual_hash)"
+      fi
+    fi
+    if ! mv -f -- "$temporary" "$destination"; then
+      rm -f "$temporary"
+      fail move "$logical_path -> $destination"
+    fi
     total=$((total + 1))
     printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
   done < <(jq -r '.items[] | [.fileId, .logicalPath, .sizeBytes, (.contentHash // ""), .downloadUrl] | @tsv' "$manifest")
