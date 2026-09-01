@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'rc=$?; printf "archive sync shell error at line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$rc" >&2; exit "$rc"' ERR
+
 : "${DASHBOARD_URL:?service URL is required}"
 : "${NAS_SYNC_TOKEN:?access token is required}"
 : "${NAS_SYNC_AGENT_ID:=archive-sync-worker}"
@@ -43,12 +45,12 @@ while :; do
   jq -c '{items: [.items[] | {fileId, sizeBytes, contentHash}]}' "$manifest" > "$completion"
 
   while IFS=$'\t' read -r file_id logical_path size_bytes content_hash download_url; do
-    [[ -n "$file_id" && -n "$logical_path" && -n "$download_url" ]] || exit 1
+    [[ -n "$file_id" && -n "$logical_path" && -n "$download_url" ]] || fail manifest "invalid item"
     destination="$NAS_SYNC_ROOT/$logical_path"
     mkdir -p "$(dirname "$destination")"
     temporary="${destination}.archive-sync.tmp.$$"
     rm -f "$temporary"
-    printf 'downloading %s\n' "$logical_path"
+    printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
     curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary" \
       || fail download "$logical_path"
     if ! actual_size="$(stat -c '%s' "$temporary")"; then
@@ -59,6 +61,7 @@ while :; do
       rm -f "$temporary"
       fail size "$logical_path (expected $size_bytes, got $actual_size)"
     fi
+    printf 'validated size for %s (%s bytes)\n' "$logical_path" "$actual_size"
     if [[ -n "$content_hash" ]]; then
       if ! actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"; then
         rm -f "$temporary"
@@ -68,11 +71,13 @@ while :; do
         rm -f "$temporary"
         fail hash "$logical_path (expected $content_hash, got $actual_hash)"
       fi
+      printf 'validated hash for %s\n' "$logical_path"
     fi
     if ! mv -f -- "$temporary" "$destination"; then
       rm -f "$temporary"
       fail move "$logical_path -> $destination"
     fi
+    printf 'stored %s\n' "$logical_path"
     total=$((total + 1))
     printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
   done < <(jq -r '.items[] | [.fileId, .logicalPath, .sizeBytes, (.contentHash // ""), .downloadUrl] | @tsv' "$manifest")
