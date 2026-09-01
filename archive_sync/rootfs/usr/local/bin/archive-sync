@@ -44,7 +44,13 @@ while :; do
   completion="$(mktemp)"
   jq -c '{items: [.items[] | {fileId, sizeBytes, contentHash}]}' "$manifest" > "$completion"
 
-  while IFS=$'\t' read -r file_id logical_path size_bytes content_hash download_url; do
+  while IFS= read -r encoded_item; do
+    item="$(printf '%s' "$encoded_item" | base64 -d)"
+    file_id="$(jq -r '.fileId // empty' <<< "$item")"
+    logical_path="$(jq -r '.logicalPath // empty' <<< "$item")"
+    size_bytes="$(jq -r '.sizeBytes // empty' <<< "$item")"
+    content_hash="$(jq -r '.contentHash // empty' <<< "$item")"
+    download_url="$(jq -r '.downloadUrl // empty' <<< "$item")"
     [[ -n "$file_id" && -n "$logical_path" && -n "$download_url" ]] || fail manifest "invalid item"
     destination="$NAS_SYNC_ROOT/$logical_path"
     mkdir -p "$(dirname "$destination")"
@@ -80,7 +86,7 @@ while :; do
     printf 'stored %s\n' "$logical_path"
     total=$((total + 1))
     printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
-  done < <(jq -r '.items[] | [.fileId, .logicalPath, .sizeBytes, (.contentHash // ""), .downloadUrl] | @tsv' "$manifest")
+  done < <(jq -r '.items[] | @base64' "$manifest")
 
   printf 'confirming batch (%s files)\n' "$count"
   response="$(curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
