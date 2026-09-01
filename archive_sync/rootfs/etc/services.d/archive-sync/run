@@ -32,6 +32,17 @@ poll_command() {
     | jq -r '.command // empty'
 }
 
+report_status() {
+  local status="$1" progress="${2:-}"
+  local token
+  token="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
+  [[ -n "$token" && -n "$service_url" ]] || return 0
+  curl --fail --silent --show-error \
+    -H "Authorization: Bearer $token" \
+    -H "X-NAS-Agent-Id: $worker_id" \
+    "$service_url/api/sync/nas/control?category=$category&status=$status${progress:+&progressDone=$progress}" >/dev/null || true
+}
+
 if [[ "$auto_start" != "true" ]]; then
   write_state idle
   echo "Archive sync is idle; start it from the service or enable auto_start"
@@ -56,9 +67,12 @@ while true; do
   export NAS_SYNC_ROOT="$destination_root"
 
   write_state running
+  report_status running 0
   /usr/local/bin/archive-sync &
   sync_pid=$!
   while kill -0 "$sync_pid" 2>/dev/null; do
+    progress="$(jq -r '.synced // 0' /data/state.json 2>/dev/null || printf '0')"
+    report_status running "$progress"
     command="$(poll_command || true)"
     if [[ "$command" == "stop" ]]; then
       kill -TERM "$sync_pid" 2>/dev/null || true
@@ -75,10 +89,12 @@ while true; do
   set -e
   if [[ "$sync_rc" == 0 ]]; then
     write_state completed
+    report_status completed
     [[ "$auto_start" == "true" ]] || exit 0
     sleep "$retry_delay"
   else
     write_state error "sync failed with exit code $sync_rc"
+    report_status error
     [[ "$auto_start" == "true" ]] || exit "$sync_rc"
     sleep "$retry_delay"
   fi
