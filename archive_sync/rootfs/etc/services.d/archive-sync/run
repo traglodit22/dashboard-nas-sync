@@ -25,7 +25,7 @@ poll_command() {
   local token
   token="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
   [[ -n "$token" && -n "$service_url" ]] || return 0
-  curl --fail --silent --show-error \
+  curl --retry 6 --retry-delay 2 --retry-max-time 90 --fail --silent --show-error \
     -H "Authorization: Bearer $token" \
     -H "X-NAS-Agent-Id: $worker_id" \
     "$service_url/api/sync/nas/control?category=$category" \

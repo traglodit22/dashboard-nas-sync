@@ -16,6 +16,8 @@ manifest=""
 completion=""
 trap 'rm -f "$manifest" "$completion"' EXIT
 
+curl_retry=(--retry 6 --retry-delay 2 --retry-max-time 90)
+
 mkdir -p "$NAS_SYNC_ROOT"
 printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
 
@@ -25,7 +27,7 @@ while :; do
     url+="&cursor=$(printf '%s' "$cursor" | jq -sRr @uri)"
   fi
   manifest="$(mktemp)"
-  curl --fail --silent --show-error \
+  curl "${curl_retry[@]}" --fail --silent --show-error \
     -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
     -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" "$url" > "$manifest"
   count="$(jq '.items | length' "$manifest")"
@@ -39,7 +41,7 @@ while :; do
     mkdir -p "$(dirname "$destination")"
     temporary="${destination}.archive-sync.tmp.$$"
     rm -f "$temporary"
-    curl --fail --silent --show-error --location "$download_url" --output "$temporary"
+    curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary"
     actual_size="$(stat -c '%s' "$temporary")"
     [[ "$actual_size" == "$size_bytes" ]] || { rm -f "$temporary"; exit 1; }
     if [[ -n "$content_hash" ]]; then
@@ -51,7 +53,7 @@ while :; do
     printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
   done < <(jq -r '.items[] | [.fileId, .logicalPath, .sizeBytes, (.contentHash // ""), .downloadUrl] | @tsv' "$manifest")
 
-  response="$(curl --fail --silent --show-error -X POST \
+  response="$(curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
     -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
     -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" \
     -H 'Content-Type: application/json' --data-binary "@$completion" "$complete_api")"

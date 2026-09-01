@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.1.0"
+version: "0.1.1"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
