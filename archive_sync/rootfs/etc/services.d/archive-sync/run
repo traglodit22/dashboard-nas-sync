@@ -12,6 +12,7 @@ retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 auto_start="$(jq -r '.auto_start' "$options")"
 
 mkdir -p /data
+pending_command=""
 
 write_state() {
   local status="$1" error="${2:-}"
@@ -43,11 +44,39 @@ report_status() {
     "$service_url/api/sync/nas/control?category=$category&status=$status${progress:+&progressDone=$progress}" >/dev/null || true
 }
 
+migrate_paths() {
+  local cursor="" manifest item old_path new_path source target
+  while :; do
+    manifest="$(mktemp)"
+    curl --retry 6 --retry-delay 2 --retry-max-time 90 --fail --silent --show-error \
+      -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
+      -H "X-NAS-Agent-Id: $worker_id" \
+      "$service_url/api/sync/nas/migration?limit=100${cursor:+&cursor=$(printf '%s' "$cursor" | jq -sRr @uri)}" > "$manifest" \
+      || { rm -f "$manifest"; return 1; }
+    while IFS=$'\t' read -r old_path new_path; do
+      source="$destination_root/$old_path"
+      target="$destination_root/$new_path"
+      [[ -f "$source" ]] || continue
+      if [[ -e "$target" ]]; then
+        printf 'migration conflict, keeping old file: %s\n' "$old_path"
+        continue
+      fi
+      mkdir -p "$(dirname "$target")"
+      mv -- "$source" "$target"
+      printf 'migrated %s -> %s\n' "$old_path" "$new_path"
+    done < <(jq -r '.items[] | [.oldPath, .newPath] | @tsv' "$manifest")
+    cursor="$(jq -r '.nextCursor // empty' "$manifest")"
+    rm -f "$manifest"
+    [[ -n "$cursor" ]] || break
+  done
+}
+
 if [[ "$auto_start" != "true" ]]; then
   write_state idle
   echo "Archive sync is idle; start it from the service or enable auto_start"
   while true; do
-    [[ "$(poll_command || true)" == "start" ]] && break
+    pending_command="$(poll_command || true)"
+    [[ "$pending_command" == "start" || "$pending_command" == "migrate" ]] && break
     sleep 2
   done
 fi
@@ -65,6 +94,25 @@ while true; do
   export NAS_SYNC_CATEGORY="$category"
   export NAS_SYNC_BATCH="$batch_size"
   export NAS_SYNC_ROOT="$destination_root"
+
+  command="${pending_command:-$(poll_command || true)}"
+  pending_command=""
+  if [[ "$command" == "migrate" ]]; then
+    write_state migrating
+    report_status running 0
+    if migrate_paths; then
+      write_state completed
+      report_status completed
+      echo "Archive path migration completed"
+    else
+      write_state error "path migration failed"
+      report_status error
+      echo "Archive path migration failed"
+    fi
+    [[ "$auto_start" == "true" ]] || exit 0
+    sleep "$retry_delay"
+    continue
+  fi
 
   write_state running
   report_status running 0
