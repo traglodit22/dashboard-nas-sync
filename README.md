@@ -1,6 +1,6 @@
-# Dashboard NAS Sync
+# Archive Sync Worker
 
-Home Assistant add-on for resumable, logical-name synchronization from the private Dashboard/GCS archive to a mounted NAS share.
+Home Assistant add-on for resumable synchronization to a mounted storage share.
 
 ## Install
 
@@ -10,16 +10,16 @@ Add this repository to Home Assistant:
 https://github.com/traglodit22/dashboard-nas-sync
 ```
 
-Install **Dashboard NAS Sync** from the add-on store.
+Install **Archive Sync Worker** from the add-on store.
 
 ## Configuration
 
-The NAS must be mounted at `/share/NAS`. Store the Dashboard WebDAV token in:
+The target share must be mounted at `/share/NAS`. Store the access token in:
 
 ```text
-/config/nas-sync-token
+/config/.archive-sync-token
 ```
 
-The add-on reads that file as `/homeassistant/nas-sync-token` and never stores the token in this repository.
+The add-on reads that file as `/homeassistant/.archive-sync-token` and never stores the token in this repository.
 
-The first supported direction is Dashboard/GCS to NAS. It uses batches, verifies size and SHA-256, and does not delete files. Bidirectional synchronization is intentionally not enabled until conflict handling is implemented.
+The worker uses batches, verifies size and SHA-256, and does not delete files. Bidirectional synchronization is intentionally disabled until conflict handling is implemented.

@@ -1,0 +1,85 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+options=/data/options.json
+service_url="$(jq -r '.service_url' "$options")"
+token_file="$(jq -r '.token_file' "$options")"
+worker_id="$(jq -r '.worker_id' "$options")"
+category="$(jq -r '.category' "$options")"
+batch_size="$(jq -r '.batch_size' "$options")"
+destination_root="$(jq -r '.destination_root' "$options")"
+retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
+auto_start="$(jq -r '.auto_start' "$options")"
+
+mkdir -p /data
+
+write_state() {
+  local status="$1" error="${2:-}"
+  jq -n --arg status "$status" --arg error "$error" \
+    '{status: $status, error: (if $error == "" then null else $error end), updatedAt: now | todateiso8601}' \
+    > /data/state.json.tmp
+  mv -f /data/state.json.tmp /data/state.json
+}
+
+poll_command() {
+  local token
+  token="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
+  [[ -n "$token" && -n "$service_url" ]] || return 0
+  curl --fail --silent --show-error \
+    -H "Authorization: Bearer $token" \
+    -H "X-NAS-Agent-Id: $worker_id" \
+    "$service_url/api/sync/nas/control?category=$category" \
+    | jq -r '.command // empty'
+}
+
+if [[ "$auto_start" != "true" ]]; then
+  write_state idle
+  echo "Archive sync is idle; start it from the service or enable auto_start"
+  while true; do
+    [[ "$(poll_command || true)" == "start" ]] && break
+    sleep 2
+  done
+fi
+
+while true; do
+  if [[ ! -s "$token_file" || -z "$service_url" ]]; then
+    echo "Service URL or token file is missing"
+    sleep "$retry_delay"
+    continue
+  fi
+
+  export DASHBOARD_URL="$service_url"
+  export NAS_SYNC_TOKEN="$(tr -d '\r\n' < "$token_file")"
+  export NAS_SYNC_AGENT_ID="$worker_id"
+  export NAS_SYNC_CATEGORY="$category"
+  export NAS_SYNC_BATCH="$batch_size"
+  export NAS_SYNC_ROOT="$destination_root"
+
+  write_state running
+  /usr/local/bin/archive-sync &
+  sync_pid=$!
+  while kill -0 "$sync_pid" 2>/dev/null; do
+    command="$(poll_command || true)"
+    if [[ "$command" == "stop" ]]; then
+      kill -TERM "$sync_pid" 2>/dev/null || true
+    elif [[ "$command" == "pause" ]]; then
+      kill -STOP "$sync_pid" 2>/dev/null || true
+    elif [[ "$command" == "resume" ]]; then
+      kill -CONT "$sync_pid" 2>/dev/null || true
+    fi
+    sleep 2
+  done
+  set +e
+  wait "$sync_pid"
+  sync_rc=$?
+  set -e
+  if [[ "$sync_rc" == 0 ]]; then
+    write_state completed
+    [[ "$auto_start" == "true" ]] || exit 0
+    sleep "$retry_delay"
+  else
+    write_state error "sync failed with exit code $sync_rc"
+    [[ "$auto_start" == "true" ]] || exit "$sync_rc"
+    sleep "$retry_delay"
+  fi
+done
