@@ -16,7 +16,12 @@ manifest=""
 completion=""
 trap 'rm -f "$manifest" "$completion"' EXIT
 
-curl_retry=(--retry 6 --retry-delay 2 --retry-max-time 90)
+curl_retry=(--retry 6 --retry-delay 2 --retry-max-time 90 --connect-timeout 20 --max-time 180)
+
+fail() {
+  printf 'archive sync failed at %s: %s\n' "$1" "$2" >&2
+  exit 1
+}
 
 mkdir -p "$NAS_SYNC_ROOT"
 printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
@@ -27,9 +32,11 @@ while :; do
     url+="&cursor=$(printf '%s' "$cursor" | jq -sRr @uri)"
   fi
   manifest="$(mktemp)"
+  printf 'requesting manifest (batch=%s)\n' "$NAS_SYNC_BATCH"
   curl "${curl_retry[@]}" --fail --silent --show-error \
     -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
-    -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" "$url" > "$manifest"
+    -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" "$url" > "$manifest" \
+    || fail manifest "Dashboard request failed"
   count="$(jq '.items | length' "$manifest")"
   [[ "$count" -gt 0 ]] || break
   completion="$(mktemp)"
@@ -41,23 +48,26 @@ while :; do
     mkdir -p "$(dirname "$destination")"
     temporary="${destination}.archive-sync.tmp.$$"
     rm -f "$temporary"
-    curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary"
+    printf 'downloading %s\n' "$logical_path"
+    curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary" \
+      || fail download "$logical_path"
     actual_size="$(stat -c '%s' "$temporary")"
-    [[ "$actual_size" == "$size_bytes" ]] || { rm -f "$temporary"; exit 1; }
+    [[ "$actual_size" == "$size_bytes" ]] || { rm -f "$temporary"; fail size "$logical_path"; }
     if [[ -n "$content_hash" ]]; then
       actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"
-      [[ "$actual_hash" == "$content_hash" ]] || { rm -f "$temporary"; exit 1; }
+      [[ "$actual_hash" == "$content_hash" ]] || { rm -f "$temporary"; fail hash "$logical_path"; }
     fi
     mv -f "$temporary" "$destination"
     total=$((total + 1))
     printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
   done < <(jq -r '.items[] | [.fileId, .logicalPath, .sizeBytes, (.contentHash // ""), .downloadUrl] | @tsv' "$manifest")
 
+  printf 'confirming batch (%s files)\n' "$count"
   response="$(curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
     -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
     -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" \
     -H 'Content-Type: application/json' --data-binary "@$completion" "$complete_api")"
-  [[ "$(jq -r '.complete // false' <<< "$response")" == true ]] || exit 1
+  [[ "$(jq -r '.complete // false' <<< "$response")" == true ]] || fail complete "$response"
   cursor="$(jq -r '.nextCursor // empty' "$manifest")"
   [[ -n "$cursor" ]] || break
 done
