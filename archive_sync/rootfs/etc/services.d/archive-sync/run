@@ -11,8 +11,8 @@ destination_root="$(jq -r '.destination_root' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 auto_start="$(jq -r '.auto_start' "$options")"
 backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
-backup_destination_root="$(jq -r '.backup_destination_root // /share/NAS/backups' "$options")"
-backup_project_name="$(jq -r '.backup_project_name // dashboard' "$options")"
+backup_destination_root="$(jq -r '.backup_destination_root // \"/share/NAS/backups\"' "$options")"
+backup_project_name="$(jq -r '.backup_project_name // \"dashboard\"' "$options")"
 
 mkdir -p /data
 pending_command=""
