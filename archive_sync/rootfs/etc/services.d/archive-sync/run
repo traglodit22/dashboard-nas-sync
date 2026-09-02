@@ -10,6 +10,9 @@ batch_size="$(jq -r '.batch_size' "$options")"
 destination_root="$(jq -r '.destination_root' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 auto_start="$(jq -r '.auto_start' "$options")"
+backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
+backup_destination_root="$(jq -r '.backup_destination_root // /share/NAS/backups' "$options")"
+backup_project_name="$(jq -r '.backup_project_name // dashboard' "$options")"
 
 mkdir -p /data
 pending_command=""
@@ -94,6 +97,9 @@ while true; do
   export NAS_SYNC_CATEGORY="$category"
   export NAS_SYNC_BATCH="$batch_size"
   export NAS_SYNC_ROOT="$destination_root"
+  export NAS_BACKUP_ENABLED="$backup_enabled"
+  export NAS_BACKUP_ROOT="$backup_destination_root"
+  export NAS_BACKUP_PROJECT_NAME="$backup_project_name"
 
   command="${pending_command:-$(poll_command || true)}"
   pending_command=""

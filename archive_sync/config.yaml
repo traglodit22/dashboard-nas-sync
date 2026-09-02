@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.2.4"
+version: "0.2.5"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -21,6 +21,9 @@ options:
   destination_root: /share/NAS
   retry_delay_seconds: 30
   auto_start: false
+  backup_enabled: true
+  backup_destination_root: /share/NAS/backups
+  backup_project_name: dashboard
 schema:
   service_url: str
   token_file: str
@@ -30,3 +33,6 @@ schema:
   destination_root: str
   retry_delay_seconds: int(5,3600)
   auto_start: bool
+  backup_enabled: bool
+  backup_destination_root: str
+  backup_project_name: match(^[a-z0-9][a-z0-9_-]{0,63}$)
