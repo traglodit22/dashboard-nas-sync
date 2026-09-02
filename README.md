@@ -30,3 +30,7 @@ slug. Backups are stored at `/share/NAS/backups/<project>/<run>/` and are
 acknowledged only after size and MD5 verification. Backup synchronization is
 run before the media queue, so long media transfers do not delay backups. The
 worker never receives object-storage credentials.
+
+Version 0.3.0 adds multi-project backup pull. See
+[`NAS_BACKUP_PROTOCOL.md`](NAS_BACKUP_PROTOCOL.md) for the public project API
+contract and the `backup_projects_json` configuration format.

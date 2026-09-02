@@ -97,6 +97,10 @@ if [[ "${NAS_BACKUP_ENABLED:-false}" == "true" ]]; then
   sync_backups
 fi
 
+if [[ "${NAS_BACKUP_ONLY:-false}" == "true" ]]; then
+  exit 0
+fi
+
 while :; do
   url="$api?category=$(printf '%s' "$NAS_SYNC_CATEGORY" | jq -sRr @uri)&limit=$NAS_SYNC_BATCH"
   if [[ -n "$cursor" ]]; then

@@ -13,6 +13,7 @@ auto_start="$(jq -r '.auto_start' "$options")"
 backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
 backup_destination_root="$(jq -r '.backup_destination_root // "/share/NAS/backups"' "$options")"
 backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
+backup_projects_json="$(jq -r '.backup_projects_json // "[]"' "$options")"
 
 mkdir -p /data
 pending_command=""
@@ -74,6 +75,33 @@ migrate_paths() {
   done
 }
 
+sync_extra_project_backups() {
+  local encoded project slug project_url project_token_file project_worker_id project_root project_token
+  jq -e 'type == "array"' <<< "$backup_projects_json" >/dev/null || {
+    echo "backup_projects_json must be a JSON array" >&2
+    return 1
+  }
+  while IFS= read -r encoded; do
+    project="$(printf '%s' "$encoded" | base64 -d)"
+    slug="$(jq -r '.slug // empty' <<< "$project")"
+    project_url="$(jq -r '.service_url // empty' <<< "$project")"
+    project_token_file="$(jq -r '.token_file // empty' <<< "$project")"
+    project_worker_id="$(jq -r '.worker_id // empty' <<< "$project")"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ && -n "$project_url" && -n "$project_token_file" && -n "$project_worker_id" ]] || {
+      echo "Skipping invalid backup project configuration" >&2
+      continue
+    }
+    project_token="$(tr -d '\r\n' < "$project_token_file" 2>/dev/null || true)"
+    [[ -n "$project_token" ]] || { echo "Missing token for backup project $slug" >&2; continue; }
+    project_root="$backup_destination_root"
+    echo "Syncing backup project $slug"
+    DASHBOARD_URL="$project_url" NAS_SYNC_TOKEN="$project_token" NAS_SYNC_AGENT_ID="$project_worker_id" \
+      NAS_SYNC_ROOT="$destination_root" NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true \
+      NAS_BACKUP_ROOT="$project_root" NAS_BACKUP_PROJECT_NAME="$slug" \
+      NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync
+  done < <(jq -r '.[] | @base64' <<< "$backup_projects_json")
+}
+
 if [[ "$auto_start" != "true" ]]; then
   write_state idle
   echo "Archive sync is idle; start it from the service or enable auto_start"
@@ -100,6 +128,13 @@ while true; do
   export NAS_BACKUP_ENABLED="$backup_enabled"
   export NAS_BACKUP_ROOT="$backup_destination_root"
   export NAS_BACKUP_PROJECT_NAME="$backup_project_name"
+
+  if ! sync_extra_project_backups; then
+    write_state error "one or more external backup projects failed"
+    report_status error
+    sleep "$retry_delay"
+    continue
+  fi
 
   command="${pending_command:-$(poll_command || true)}"
   pending_command=""
