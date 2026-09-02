@@ -24,8 +24,9 @@ The add-on reads that file as `/homeassistant/.archive-sync-token` and never sto
 
 The worker uses batches, verifies size and SHA-256, and does not delete files. Bidirectional synchronization is intentionally disabled until conflict handling is implemented.
 
-Version 0.2.5 also supports pulling encrypted project backups. Enable
+Version 0.2.8 also supports pulling encrypted project backups. Enable
 `backup_enabled` and set `backup_project_name` to a unique lowercase project
 slug. Backups are stored at `/share/NAS/backups/<project>/<run>/` and are
-acknowledged only after size and MD5 verification. The worker never receives
-object-storage credentials.
+acknowledged only after size and MD5 verification. Backup synchronization is
+run before the media queue, so long media transfers do not delay backups. The
+worker never receives object-storage credentials.

@@ -88,6 +88,11 @@ fail() {
 mkdir -p "$NAS_SYNC_ROOT"
 printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
 
+if [[ "${NAS_BACKUP_ENABLED:-false}" == "true" ]]; then
+  printf 'syncing project backups before media files\n'
+  sync_backups
+fi
+
 while :; do
   url="$api?category=$(printf '%s' "$NAS_SYNC_CATEGORY" | jq -sRr @uri)&limit=$NAS_SYNC_BATCH"
   if [[ -n "$cursor" ]]; then
@@ -178,7 +183,3 @@ while :; do
   cursor="$(jq -r '.nextCursor // empty' "$manifest")"
   [[ -n "$cursor" ]] || break
 done
-
-if [[ "${NAS_BACKUP_ENABLED:-false}" == "true" ]]; then
-  sync_backups
-fi
