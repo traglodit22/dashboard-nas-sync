@@ -31,7 +31,7 @@ sync_backups() {
     jq -n '{receipts: []}' > "$receipt"
     while IFS= read -r encoded_item; do
     item="$(printf '%s' "$encoded_item" | base64 -d)"
-    run_id="$(jq -r '.runId // empty' <<< "$item")"
+    run_id="$(jq -r '.runId // .run_id // empty' <<< "$item")"
     role="$(jq -r '.role // empty' <<< "$item")"
     key="$(jq -r '.key // empty' <<< "$item")"
     relative_path="$(jq -r '.relativePath // empty' <<< "$item")"
@@ -39,7 +39,15 @@ sync_backups() {
     md5_hex="$(jq -r '.md5Hex // empty' <<< "$item")"
     generation="$(jq -r '.gcsGeneration // empty' <<< "$item")"
     download_url="$(jq -r '.downloadUrl // empty' <<< "$item")"
-    [[ -n "$run_id" && -n "$role" && -n "$key" && -n "$relative_path" && -n "$download_url" ]] || fail manifest "invalid backup item"
+    if [[ -z "$run_id" || -z "$role" || -z "$key" || -z "$relative_path" || -z "$download_url" ]]; then
+      missing_fields=""
+      [[ -n "$run_id" ]] || missing_fields+=" runId"
+      [[ -n "$role" ]] || missing_fields+=" role"
+      [[ -n "$key" ]] || missing_fields+=" key"
+      [[ -n "$relative_path" ]] || missing_fields+=" relativePath"
+      [[ -n "$download_url" ]] || missing_fields+=" downloadUrl"
+      fail manifest "invalid backup item; missing:${missing_fields}"
+    fi
     [[ "$relative_path" == "$project/"* ]] || fail manifest "backup project mismatch"
     destination="$root/$relative_path"
     mkdir -p "$(dirname "$destination")"
@@ -60,7 +68,7 @@ sync_backups() {
       '.receipts += [{runId: $runId, role: $role, key: $key, sizeBytes: $sizeBytes, md5Hex: $md5Hex, gcsGeneration: ($generation | if . == "" then null else . end)}]' "$receipt" > "${receipt}.next"
     mv -f "${receipt}.next" "$receipt"
     total=$((total + 1))
-  done < <(jq -r '.runs[] as $run | $run.objects[] | . + {runId: $run.runId, stamp: $run.stamp} | @base64' "$manifest")
+  done < <(jq -r '.runs[] | {run: ., object: .objects[]} | {runId: .run.runId, stamp: .run.stamp} + .object | @base64' "$manifest")
     if [[ "$(jq '.receipts | length' "$receipt")" -gt 0 ]]; then
     curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
       -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
