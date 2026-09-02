@@ -9,6 +9,26 @@ trap 'rc=$?; printf "archive sync shell error at line %s: %s (exit %s)\n" "$LINE
 : "${NAS_SYNC_ROOT:=/share/NAS}"
 : "${NAS_SYNC_CATEGORY:=primary}"
 : "${NAS_SYNC_BATCH:=100}"
+: "${NAS_DOWNLOAD_TIMEOUT_SECONDS:=1800}"
+
+download_with_resume() {
+  local download_url="$1" destination="$2" attempt
+
+  for attempt in 1 2 3; do
+    if curl --fail --silent --show-error --location \
+      --connect-timeout 30 \
+      --max-time "$NAS_DOWNLOAD_TIMEOUT_SECONDS" \
+      --retry 2 --retry-delay 5 --retry-connrefused \
+      --continue-at - \
+      "$download_url" --output "$destination"; then
+      return 0
+    fi
+    printf 'download attempt %s failed for %s; resuming if possible\n' "$attempt" "$destination" >&2
+  done
+
+  printf 'download failed after retries: %s\n' "$destination" >&2
+  return 1
+}
 
 sync_backups() {
   local manifest_url="${NAS_BACKUP_MANIFEST_URL:-${DASHBOARD_URL%/}/api/sync/nas/backups/manifest}"
@@ -53,7 +73,7 @@ sync_backups() {
     mkdir -p "$(dirname "$destination")"
     temporary="${destination}.archive-sync.tmp.$$"
     rm -f "$temporary"
-    if ! curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary"; then
+    if ! download_with_resume "$download_url" "$temporary"; then
       rm -f "$temporary"
       printf 'missing or unavailable object, skipping: %s\n' "$relative_path" >&2
       continue
@@ -140,7 +160,7 @@ while :; do
     temporary="${destination}.archive-sync.tmp.$$"
     rm -f "$temporary"
     printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
-    if ! curl "${curl_retry[@]}" --fail --silent --show-error --location "$download_url" --output "$temporary"; then
+    if ! download_with_resume "$download_url" "$temporary"; then
       rm -f "$temporary"
       printf 'missing or unavailable object, recording and skipping: %s\n' "$logical_path" >&2
       jq --arg fileId "$file_id" --arg reason "GCS download returned HTTP 404 or another terminal error" \
