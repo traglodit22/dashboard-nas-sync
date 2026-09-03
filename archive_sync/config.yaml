@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.3.5"
+version: "0.4.0"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -19,6 +19,8 @@ options:
   category: gallery
   batch_size: 100
   parallel_downloads: 4
+  cloud_sync_enabled: false
+  cloud_parallel_downloads: 2
   destination_root: /share/NAS
   retry_delay_seconds: 30
   auto_start: false
@@ -33,6 +35,8 @@ schema:
   category: match(^gallery$|^cloud$)
   batch_size: int(1,500)
   parallel_downloads: int(1,16)
+  cloud_sync_enabled: bool
+  cloud_parallel_downloads: int(1,16)
   destination_root: str
   retry_delay_seconds: int(5,3600)
   auto_start: bool

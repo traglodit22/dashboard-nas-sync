@@ -10,6 +10,7 @@ trap 'rc=$?; printf "archive sync shell error at line %s: %s (exit %s)\n" "$LINE
 : "${NAS_SYNC_CATEGORY:=primary}"
 : "${NAS_SYNC_BATCH:=100}"
 : "${NAS_SYNC_PARALLEL:=4}"
+: "${NAS_SYNC_STATE_FILE:=/data/state.json}"
 : "${NAS_DOWNLOAD_TIMEOUT_SECONDS:=1800}"
 
 download_with_resume() {
@@ -113,8 +114,8 @@ results_dir=""
 trap 'rm -f "$manifest" "$completion" "$missing"; [[ -n "$results_dir" ]] && rm -rf "$results_dir" || true' EXIT
 
 update_state() {
-  printf '{"synced":%s,"updatedAt":"%s"}\n' "$1" "$(date -u +%FT%TZ)" > /data/state.json.tmp 2>/dev/null \
-    && mv -f /data/state.json.tmp /data/state.json 2>/dev/null || true
+  printf '{"synced":%s,"updatedAt":"%s"}\n' "$1" "$(date -u +%FT%TZ)" > "$NAS_SYNC_STATE_FILE.tmp" 2>/dev/null \
+    && mv -f "$NAS_SYNC_STATE_FILE.tmp" "$NAS_SYNC_STATE_FILE" 2>/dev/null || true
 }
 
 # Скачивает один файл манифеста параллельно с другими. Никогда не падает:
@@ -177,13 +178,13 @@ fail() {
 }
 
 mkdir -p "$NAS_SYNC_ROOT"
-printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
+printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > "$NAS_SYNC_STATE_FILE" 2>/dev/null || true
 
 if [[ "${NAS_BACKUP_ENABLED:-false}" == "true" ]]; then
   printf 'syncing project backups before media files\n'
   if ! ( sync_backups ); then
     printf 'backup sync failed; continuing with media files\n' >&2
-    printf '{"synced":0,"backupError":"backup sync failed","updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
+    printf '{"synced":0,"backupError":"backup sync failed","updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > "$NAS_SYNC_STATE_FILE" 2>/dev/null || true
   fi
 fi
 

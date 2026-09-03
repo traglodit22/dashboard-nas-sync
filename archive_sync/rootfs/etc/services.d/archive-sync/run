@@ -8,6 +8,8 @@ worker_id="$(jq -r '.worker_id' "$options")"
 category="$(jq -r '.category' "$options")"
 batch_size="$(jq -r '.batch_size' "$options")"
 parallel_downloads="$(jq -r '.parallel_downloads // 4' "$options")"
+cloud_sync_enabled="$(jq -r '.cloud_sync_enabled // false' "$options")"
+cloud_parallel_downloads="$(jq -r '.cloud_parallel_downloads // 2' "$options")"
 destination_root="$(jq -r '.destination_root' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 auto_start="$(jq -r '.auto_start' "$options")"
@@ -17,45 +19,45 @@ backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
 backup_projects_json="$(jq -r '.backup_projects_json // "[]"' "$options")"
 
 mkdir -p /data
-pending_command=""
 
-write_state() {
-  local status="$1" error="${2:-}"
-  jq -n --arg status "$status" --arg error "$error" \
-    '{status: $status, error: (if $error == "" then null else $error end), updatedAt: now | todateiso8601}' \
-    > /data/state.json.tmp
-  mv -f /data/state.json.tmp /data/state.json
+export DASHBOARD_URL="$service_url"
+export NAS_SYNC_ROOT="$destination_root"
+export NAS_SYNC_BATCH="$batch_size"
+export NAS_BACKUP_ROOT="$backup_destination_root"
+export NAS_BACKUP_PROJECT_NAME="$backup_project_name"
+
+read_token() {
+  tr -d '\r\n' < "$token_file" 2>/dev/null || true
 }
 
 poll_command() {
-  local token
-  token="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
+  local agent="$1" cat="$2" token
+  token="$(read_token)"
   [[ -n "$token" && -n "$service_url" ]] || return 0
   curl --retry 6 --retry-delay 2 --retry-max-time 90 --fail --silent --show-error \
     -H "Authorization: Bearer $token" \
-    -H "X-NAS-Agent-Id: $worker_id" \
-    "$service_url/api/sync/nas/control?category=$category" \
+    -H "X-NAS-Agent-Id: $agent" \
+    "$service_url/api/sync/nas/control?category=$cat" \
     | jq -r '.command // empty'
 }
 
 report_status() {
-  local status="$1" progress="${2:-}"
-  local token
-  token="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
+  local agent="$1" cat="$2" status="$3" progress="${4:-}" token
+  token="$(read_token)"
   [[ -n "$token" && -n "$service_url" ]] || return 0
   curl --fail --silent --show-error \
     -H "Authorization: Bearer $token" \
-    -H "X-NAS-Agent-Id: $worker_id" \
-    "$service_url/api/sync/nas/control?category=$category&status=$status${progress:+&progressDone=$progress}" >/dev/null || true
+    -H "X-NAS-Agent-Id: $agent" \
+    "$service_url/api/sync/nas/control?category=$cat&status=$status${progress:+&progressDone=$progress}" >/dev/null || true
 }
 
 migrate_paths() {
-  local cursor="" manifest item old_path new_path source target
+  local agent="$1" cursor="" manifest item old_path new_path source target
   while :; do
     manifest="$(mktemp)"
     curl --retry 6 --retry-delay 2 --retry-max-time 90 --fail --silent --show-error \
       -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
-      -H "X-NAS-Agent-Id: $worker_id" \
+      -H "X-NAS-Agent-Id: $agent" \
       "$service_url/api/sync/nas/migration?limit=100${cursor:+&cursor=$(printf '%s' "$cursor" | jq -sRr @uri)}" > "$manifest" \
       || { rm -f "$manifest"; return 1; }
     while IFS=$'\t' read -r old_path new_path; do
@@ -103,91 +105,112 @@ sync_extra_project_backups() {
   done < <(jq -r '.[] | @base64' <<< "$backup_projects_json")
 }
 
-if [[ "$auto_start" != "true" ]]; then
-  write_state idle
-  echo "Archive sync is idle; start it from the service or enable auto_start"
+# Независимый воркер одной категории: свой agent id, свой state-файл,
+# свой канал команд на дашборде. with_backups=true только у основного.
+supervise_worker() {
+  local w_category="$1" w_agent="$2" w_parallel="$3" w_state="$4" w_backups="$5"
+  local command sync_pid sync_rc progress
+
+  if [[ "$auto_start" != "true" ]]; then
+    echo "[$w_category] idle; waiting for start command (agent $w_agent)"
+    report_status "$w_agent" "$w_category" idle ""
+    while true; do
+      command="$(poll_command "$w_agent" "$w_category" || true)"
+      [[ "$command" == "start" ]] && break
+      [[ "$w_category" == "gallery" && "$command" == "migrate" ]] && break
+      sleep 2
+    done
+  fi
+
   while true; do
-    pending_command="$(poll_command || true)"
-    [[ "$pending_command" == "start" || "$pending_command" == "migrate" ]] && break
-    sleep 2
+    if [[ ! -s "$token_file" || -z "$service_url" ]]; then
+      echo "[$w_category] service URL or token file is missing"
+      sleep "$retry_delay"
+      continue
+    fi
+
+    NAS_SYNC_TOKEN="$(read_token)"
+    export NAS_SYNC_TOKEN
+
+    command="$(poll_command "$w_agent" "$w_category" || true)"
+    if [[ "$w_category" == "gallery" && "$command" == "migrate" ]]; then
+      report_status "$w_agent" "$w_category" running 0
+      if migrate_paths "$w_agent"; then
+        report_status "$w_agent" "$w_category" completed ""
+        echo "[gallery] path migration completed"
+      else
+        report_status "$w_agent" "$w_category" error ""
+        echo "[gallery] path migration failed"
+      fi
+      [[ "$auto_start" == "true" ]] || return 0
+      sleep "$retry_delay"
+      continue
+    fi
+
+    if [[ "$w_backups" == "true" ]]; then
+      if ! sync_extra_project_backups; then
+        report_status "$w_agent" "$w_category" error ""
+        echo "[$w_category] external backup projects failed; retrying in ${retry_delay}s"
+        sleep "$retry_delay"
+        continue
+      fi
+    fi
+
+    report_status "$w_agent" "$w_category" running 0
+    if [[ "$w_backups" == "true" ]]; then
+      export NAS_BACKUP_ENABLED="$backup_enabled"
+    else
+      export NAS_BACKUP_ENABLED=false
+    fi
+    NAS_SYNC_CATEGORY="$w_category" \
+    NAS_SYNC_AGENT_ID="$w_agent" \
+    NAS_SYNC_PARALLEL="$w_parallel" \
+    NAS_SYNC_STATE_FILE="$w_state" \
+      /usr/local/bin/archive-sync &
+    sync_pid=$!
+    while kill -0 "$sync_pid" 2>/dev/null; do
+      progress="$(jq -r '.synced // 0' "$w_state" 2>/dev/null || printf '0')"
+      report_status "$w_agent" "$w_category" running "$progress"
+      command="$(poll_command "$w_agent" "$w_category" || true)"
+      case "$command" in
+        stop)
+          kill -CONT "$sync_pid" 2>/dev/null || true
+          kill -TERM "$sync_pid" 2>/dev/null || true
+          ;;
+        pause)
+          kill -STOP "$sync_pid" 2>/dev/null || true
+          report_status "$w_agent" "$w_category" paused "$progress"
+          ;;
+        resume)
+          kill -CONT "$sync_pid" 2>/dev/null || true
+          ;;
+      esac
+      sleep 2
+    done
+    set +e
+    wait "$sync_pid"
+    sync_rc=$?
+    set -e
+    if [[ "$sync_rc" == 0 ]]; then
+      report_status "$w_agent" "$w_category" completed ""
+      echo "[$w_category] sync completed"
+      [[ "$auto_start" == "true" ]] || return 0
+      sleep "$retry_delay"
+    else
+      report_status "$w_agent" "$w_category" error ""
+      echo "[$w_category] sync failed with exit code $sync_rc; retrying in ${retry_delay}s"
+      # Once started, keep retrying transient failures instead of returning to idle.
+      sleep "$retry_delay"
+    fi
   done
+}
+
+supervise_worker "$category" "$worker_id" "$parallel_downloads" "/data/state-$category.json" "true" &
+worker_pids="$!"
+if [[ "$cloud_sync_enabled" == "true" && "$category" != "cloud" ]]; then
+  supervise_worker "cloud" "${worker_id}-cloud" "$cloud_parallel_downloads" "/data/state-cloud.json" "false" &
+  worker_pids="$worker_pids $!"
 fi
 
-while true; do
-  if [[ ! -s "$token_file" || -z "$service_url" ]]; then
-    echo "Service URL or token file is missing"
-    sleep "$retry_delay"
-    continue
-  fi
-
-  export DASHBOARD_URL="$service_url"
-  export NAS_SYNC_TOKEN="$(tr -d '\r\n' < "$token_file")"
-  export NAS_SYNC_AGENT_ID="$worker_id"
-  export NAS_SYNC_CATEGORY="$category"
-  export NAS_SYNC_BATCH="$batch_size"
-  export NAS_SYNC_PARALLEL="$parallel_downloads"
-  export NAS_SYNC_ROOT="$destination_root"
-  export NAS_BACKUP_ENABLED="$backup_enabled"
-  export NAS_BACKUP_ROOT="$backup_destination_root"
-  export NAS_BACKUP_PROJECT_NAME="$backup_project_name"
-
-  if ! sync_extra_project_backups; then
-    write_state error "one or more external backup projects failed"
-    report_status error
-    sleep "$retry_delay"
-    continue
-  fi
-
-  command="${pending_command:-$(poll_command || true)}"
-  pending_command=""
-  if [[ "$command" == "migrate" ]]; then
-    write_state migrating
-    report_status running 0
-    if migrate_paths; then
-      write_state completed
-      report_status completed
-      echo "Archive path migration completed"
-    else
-      write_state error "path migration failed"
-      report_status error
-      echo "Archive path migration failed"
-    fi
-    [[ "$auto_start" == "true" ]] || exit 0
-    sleep "$retry_delay"
-    continue
-  fi
-
-  write_state running
-  report_status running 0
-  /usr/local/bin/archive-sync &
-  sync_pid=$!
-  while kill -0 "$sync_pid" 2>/dev/null; do
-    progress="$(jq -r '.synced // 0' /data/state.json 2>/dev/null || printf '0')"
-    report_status running "$progress"
-    command="$(poll_command || true)"
-    if [[ "$command" == "stop" ]]; then
-      kill -TERM "$sync_pid" 2>/dev/null || true
-    elif [[ "$command" == "pause" ]]; then
-      kill -STOP "$sync_pid" 2>/dev/null || true
-    elif [[ "$command" == "resume" ]]; then
-      kill -CONT "$sync_pid" 2>/dev/null || true
-    fi
-    sleep 2
-  done
-  set +e
-  wait "$sync_pid"
-  sync_rc=$?
-  set -e
-  if [[ "$sync_rc" == 0 ]]; then
-    write_state completed
-    report_status completed
-    [[ "$auto_start" == "true" ]] || exit 0
-    sleep "$retry_delay"
-  else
-    write_state error "sync failed with exit code $sync_rc"
-    report_status error
-    echo "Archive sync failed with exit code $sync_rc; retrying in ${retry_delay}s"
-    # Once started, keep retrying transient failures instead of returning to idle.
-    sleep "$retry_delay"
-  fi
-done
+# shellcheck disable=SC2086
+wait $worker_pids || true
