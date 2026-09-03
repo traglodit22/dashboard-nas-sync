@@ -122,7 +122,10 @@ printf '{"synced":0,"updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json
 
 if [[ "${NAS_BACKUP_ENABLED:-false}" == "true" ]]; then
   printf 'syncing project backups before media files\n'
-  sync_backups
+  if ! ( sync_backups ); then
+    printf 'backup sync failed; continuing with media files\n' >&2
+    printf '{"synced":0,"backupError":"backup sync failed","updatedAt":"%s"}\n' "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
+  fi
 fi
 
 if [[ "${NAS_BACKUP_ONLY:-false}" == "true" ]]; then
