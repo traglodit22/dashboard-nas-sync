@@ -9,6 +9,7 @@ trap 'rc=$?; printf "archive sync shell error at line %s: %s (exit %s)\n" "$LINE
 : "${NAS_SYNC_ROOT:=/share/NAS}"
 : "${NAS_SYNC_CATEGORY:=primary}"
 : "${NAS_SYNC_BATCH:=100}"
+: "${NAS_SYNC_PARALLEL:=4}"
 : "${NAS_DOWNLOAD_TIMEOUT_SECONDS:=1800}"
 
 download_with_resume() {
@@ -108,7 +109,65 @@ total=0
 manifest=""
 completion=""
 missing=""
-trap 'rm -f "$manifest" "$completion"' EXIT
+results_dir=""
+trap 'rm -f "$manifest" "$completion" "$missing"; [[ -n "$results_dir" ]] && rm -rf "$results_dir" || true' EXIT
+
+update_state() {
+  printf '{"synced":%s,"updatedAt":"%s"}\n' "$1" "$(date -u +%FT%TZ)" > /data/state.json.tmp 2>/dev/null \
+    && mv -f /data/state.json.tmp /data/state.json 2>/dev/null || true
+}
+
+# Скачивает один файл манифеста параллельно с другими. Никогда не падает:
+# результат — файл <fileId>.ok (строка JSON для completion) или
+# <fileId>.err (причина для /missing) в $results_dir.
+process_item() {
+  local file_id="$1" logical_path="$2" size_bytes="$3" content_hash="$4" download_url="$5"
+  local destination="$NAS_SYNC_ROOT/$logical_path"
+  mkdir -p "$(dirname "$destination")"
+
+  # Уже скачан ранее (рестарт после сбоя в середине пачки) — пропускаем.
+  # Файл проверялся хэшем при первой закачке, здесь достаточно размера.
+  if [[ -f "$destination" ]] && [[ "$(stat -c '%s' "$destination" 2>/dev/null)" == "$size_bytes" ]]; then
+    jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
+      '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end)}' \
+      > "$results_dir/$file_id.ok"
+    return 0
+  fi
+
+  local temporary="${destination}.archive-sync.tmp.${file_id}"
+  rm -f "$temporary"
+  printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
+  if ! download_with_resume "$download_url" "$temporary"; then
+    rm -f "$temporary"
+    printf 'GCS download returned HTTP 404 or another terminal error' > "$results_dir/$file_id.err"
+    return 0
+  fi
+  local actual_size
+  actual_size="$(stat -c '%s' "$temporary")"
+  if [[ "$actual_size" != "$size_bytes" ]]; then
+    rm -f "$temporary"
+    printf 'size mismatch: expected %s, got %s' "$size_bytes" "$actual_size" > "$results_dir/$file_id.err"
+    return 0
+  fi
+  if [[ -n "$content_hash" ]]; then
+    local actual_hash
+    actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"
+    if [[ "$actual_hash" != "$content_hash" ]]; then
+      rm -f "$temporary"
+      printf 'hash mismatch: expected %s, got %s' "$content_hash" "$actual_hash" > "$results_dir/$file_id.err"
+      return 0
+    fi
+  fi
+  if ! mv -f -- "$temporary" "$destination"; then
+    rm -f "$temporary"
+    printf 'move failed' > "$results_dir/$file_id.err"
+    return 0
+  fi
+  printf 'stored %s\n' "$logical_path"
+  jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
+    '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end)}' \
+    > "$results_dir/$file_id.ok"
+}
 
 curl_retry=(--retry 6 --retry-delay 2 --retry-max-time 90 --connect-timeout 20 --max-time 180)
 
@@ -145,10 +204,7 @@ while :; do
     || fail manifest "Dashboard request failed"
   count="$(jq '.items | length' "$manifest")"
   [[ "$count" -gt 0 ]] || break
-  completion="$(mktemp)"
-  missing="$(mktemp)"
-  jq -n '{items: []}' > "$completion"
-  jq -n '{items: []}' > "$missing"
+  results_dir="$(mktemp -d)"
 
   while IFS= read -r encoded_item; do
     item="$(printf '%s' "$encoded_item" | base64 -d)"
@@ -158,67 +214,46 @@ while :; do
     content_hash="$(jq -r '.contentHash // empty' <<< "$item")"
     download_url="$(jq -r '.downloadUrl // empty' <<< "$item")"
     [[ -n "$file_id" && -n "$logical_path" && -n "$download_url" ]] || fail manifest "invalid item"
-    destination="$NAS_SYNC_ROOT/$logical_path"
-    mkdir -p "$(dirname "$destination")"
-    temporary="${destination}.archive-sync.tmp.$$"
-    rm -f "$temporary"
-    printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
-    if ! download_with_resume "$download_url" "$temporary"; then
-      rm -f "$temporary"
-      printf 'missing or unavailable object, recording and skipping: %s\n' "$logical_path" >&2
-      jq --arg fileId "$file_id" --arg reason "GCS download returned HTTP 404 or another terminal error" \
-        '.items += [{fileId: $fileId, reason: $reason}]' "$missing" > "${missing}.next"
-      mv -f "${missing}.next" "$missing"
-      continue
-    fi
-    if ! actual_size="$(stat -c '%s' "$temporary")"; then
-      rm -f "$temporary"
-      fail size "cannot stat $logical_path"
-    fi
-    if [[ "$actual_size" != "$size_bytes" ]]; then
-      rm -f "$temporary"
-      fail size "$logical_path (expected $size_bytes, got $actual_size)"
-    fi
-    printf 'validated size for %s (%s bytes)\n' "$logical_path" "$actual_size"
-    if [[ -n "$content_hash" ]]; then
-      if ! actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"; then
-        rm -f "$temporary"
-        fail hash "cannot hash $logical_path"
-      fi
-      if [[ "$actual_hash" != "$content_hash" ]]; then
-        rm -f "$temporary"
-        fail hash "$logical_path (expected $content_hash, got $actual_hash)"
-      fi
-      printf 'validated hash for %s\n' "$logical_path"
-    fi
-    if ! mv -f -- "$temporary" "$destination"; then
-      rm -f "$temporary"
-      fail move "$logical_path -> $destination"
-    fi
-    jq --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
-      '.items += [{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end)}]' "$completion" > "${completion}.next"
-    mv -f "${completion}.next" "$completion"
-    printf 'stored %s\n' "$logical_path"
-    total=$((total + 1))
-    printf '{"synced":%s,"updatedAt":"%s"}\n' "$total" "$(date -u +%FT%TZ)" > /data/state.json 2>/dev/null || true
+    while (( $(jobs -pr | wc -l) >= NAS_SYNC_PARALLEL )); do
+      wait -n || true
+    done
+    process_item "$file_id" "$logical_path" "$size_bytes" "$content_hash" "$download_url" &
   done < <(jq -r '.items[] | @base64' "$manifest")
+  wait
 
-  if [[ "$(jq '.items | length' "$completion")" -gt 0 ]]; then
-    printf 'confirming downloaded files\n'
+  shopt -s nullglob
+  ok_files=("$results_dir"/*.ok)
+  err_files=("$results_dir"/*.err)
+  shopt -u nullglob
+
+  if (( ${#ok_files[@]} > 0 )); then
+    printf 'confirming %s downloaded files\n' "${#ok_files[@]}"
+    completion="$(mktemp)"
+    jq -cs '{items: .}' "${ok_files[@]}" > "$completion"
     response="$(curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
       -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
       -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" \
       -H 'Content-Type: application/json' --data-binary "@$completion" "$complete_api")"
     [[ "$(jq -r '.complete // false' <<< "$response")" == true ]] || fail complete "$response"
+    total=$((total + ${#ok_files[@]}))
   fi
-  if [[ "$(jq '.items | length' "$missing")" -gt 0 ]]; then
-    printf 'recording unavailable objects\n'
+  if (( ${#err_files[@]} > 0 )); then
+    printf 'recording %s unavailable object(s)\n' "${#err_files[@]}"
+    missing="$(mktemp)"
+    for err_file in "${err_files[@]}"; do
+      jq -nc --arg fileId "$(basename "$err_file" .err)" --rawfile reason "$err_file" \
+        '{fileId: $fileId, reason: ($reason | gsub("\n"; " ") | .[0:300])}'
+    done | jq -cs '{items: .}' > "$missing"
     curl "${curl_retry[@]}" --fail --silent --show-error -X POST \
       -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
       -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" \
       -H 'Content-Type: application/json' --data-binary "@$missing" "$missing_api" >/dev/null \
       || fail missing "Could not record unavailable objects"
   fi
+  rm -rf "$results_dir"
+  results_dir=""
+  update_state "$total"
+  printf 'synced %s files total\n' "$total"
   cursor="$(jq -r '.nextCursor // empty' "$manifest")"
   [[ -n "$cursor" ]] || break
 done
