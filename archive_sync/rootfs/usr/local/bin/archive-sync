@@ -45,7 +45,7 @@ sync_backups() {
     curl "${curl_retry[@]}" --fail --silent --show-error \
       -H "Authorization: Bearer $NAS_SYNC_TOKEN" \
       -H "X-NAS-Agent-Id: $NAS_SYNC_AGENT_ID" \
-      "$manifest_url?limit=$NAS_SYNC_BATCH" > "$manifest" \
+      "$manifest_url?limit=$NAS_SYNC_BATCH&project=$project" > "$manifest" \
       || fail manifest "Backup request failed"
     jq -e '.schemaVersion == 1' "$manifest" >/dev/null || fail manifest "invalid backup schema"
     run_count="$(jq '.runs | length' "$manifest")"
