@@ -322,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(411, {"error": "Content-Length required"})
             return
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        tmp = f"{target}.nas-upload.tmp.{os.getpid()}"
+        tmp = f"{target}.part"
         md5 = hashlib.md5()
         remaining = length
         try:
