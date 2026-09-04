@@ -37,7 +37,6 @@ elif [[ -n "$private_key" ]]; then
   if ! ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
     # Пересборка PEM: срезаем маркеры, убираем все пробельные, wrap по 70.
     # printf '%s\n' гарантирует перевод строки перед END-маркером.
-    local body
     body="$(printf '%s' "$normalized" \
       | sed 's/-----BEGIN OPENSSH PRIVATE KEY-----//; s/-----END OPENSSH PRIVATE KEY-----//' \
       | tr -d ' \r\n\t')"
