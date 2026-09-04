@@ -12,7 +12,10 @@ if [[ "$files_enabled" != "true" ]]; then
   exec sleep infinity
 fi
 
+files_token_file="$(jq -r '.files_token_file // ""' "$options")"
+
 export NAS_SYNC_TOKEN_FILE="$token_file"
+export NAS_FILES_TOKEN_FILE="$files_token_file"
 export NAS_FILES_ENABLED="true"
 export NAS_FILES_ROOT="$files_root"
 

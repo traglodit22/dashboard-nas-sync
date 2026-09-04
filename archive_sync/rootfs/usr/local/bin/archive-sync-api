@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 STATE = "/data/state.json"
 CONTROL = "/data/control"
 TOKEN_FILE = os.environ.get("NAS_SYNC_TOKEN_FILE", "/homeassistant/.archive-sync-token")
+# Доп. токен для file API (например отдельный токен Dashboard-сервера).
+EXTRA_TOKEN_FILE = os.environ.get("NAS_FILES_TOKEN_FILE", "")
 
 FILES_ENABLED = os.environ.get("NAS_FILES_ENABLED", "false").lower() == "true"
 FILES_ROOT = os.path.realpath(os.environ.get("NAS_FILES_ROOT", "/share/NAS"))
@@ -49,16 +51,26 @@ def write_control(value):
         f.write(value)
 
 
+def _read_token(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def authorized(request):
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         return False
-    try:
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            expected = f.read().strip()
-    except OSError:
-        return False
-    return bool(expected) and secrets.compare_digest(header[7:].strip(), expected)
+    given = header[7:].strip()
+    for path in (TOKEN_FILE, EXTRA_TOKEN_FILE):
+        if not path:
+            continue
+        expected = _read_token(path)
+        if expected and secrets.compare_digest(given, expected):
+            return True
+    return False
 
 
 def resolve_file_path(raw_path):
