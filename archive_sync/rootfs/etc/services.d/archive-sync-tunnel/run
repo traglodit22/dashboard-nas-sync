@@ -17,34 +17,50 @@ port="$(jq -r '.tunnel_port // 22' "$options")"
 user="$(jq -r '.tunnel_user // "nas-tunnel"' "$options")"
 remote_bind="$(jq -r '.tunnel_remote_bind // "127.0.0.1:18125"' "$options")"
 private_key="$(jq -r '.tunnel_private_key // empty' "$options")"
-
-if [[ -z "$host" || -z "$private_key" ]]; then
-  echo "NAS tunnel: tunnel_host/tunnel_private_key не заданы — сплю"
-  exec sleep infinity
-fi
+key_file_opt="$(jq -r '.tunnel_key_file // empty' "$options")"
 
 key_file=/data/tunnel_key
 
-write_key() {
-  printf '%s\n' "$private_key" > "$key_file"
+# Приоритет: файл с ключом на HA-хосте (надёжно, без YAML-эскейпинга).
+if [[ -n "$key_file_opt" && -s "$key_file_opt" ]]; then
+  cp "$key_file_opt" "$key_file"
   chmod 600 "$key_file"
-  if ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
-    return 0
+  echo "NAS tunnel: ключ из файла $key_file_opt"
+elif [[ -n "$private_key" ]]; then
+  # Варианты порчи при вставке в YAML/форму: схлопнутые переводы строк,
+  # литеральные "\n", обрамляющие кавычки. Нормализуем всё.
+  normalized="$(printf '%s' "$private_key" \
+    | sed 's/\\r\\n/\n/g; s/\\n/\n/g' \
+    | sed 's/^["'"'"']//; s/["'"'"']$//')"
+  printf '%s\n' "$normalized" > "$key_file"
+  chmod 600 "$key_file"
+  if ! ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
+    # Пересборка PEM: срезаем маркеры, убираем все пробельные, wrap по 70.
+    # printf '%s\n' гарантирует перевод строки перед END-маркером.
+    local body
+    body="$(printf '%s' "$normalized" \
+      | sed 's/-----BEGIN OPENSSH PRIVATE KEY-----//; s/-----END OPENSSH PRIVATE KEY-----//' \
+      | tr -d ' \r\n\t')"
+    { echo '-----BEGIN OPENSSH PRIVATE KEY-----'
+      printf '%s\n' "$body" | fold -w 70
+      echo '-----END OPENSSH PRIVATE KEY-----'
+    } > "$key_file"
+    chmod 600 "$key_file"
   fi
-  # Частая поломка: YAML/форма схлопнула переводы строк в пробелы.
-  # Пересобираем PEM: срезаем маркеры, убираем пробелы/переносы, wrap по 70.
-  printf '%s' "$private_key" \
-    | sed 's/-----BEGIN OPENSSH PRIVATE KEY-----//; s/-----END OPENSSH PRIVATE KEY-----//' \
-    | tr -d ' \r\n\t' \
-    | fold -w 70 \
-    | { echo '-----BEGIN OPENSSH PRIVATE KEY-----'; cat; echo '-----END OPENSSH PRIVATE KEY-----'; } \
-    > "$key_file"
-  chmod 600 "$key_file"
-  ssh-keygen -y -f "$key_file" >/dev/null 2>&1
-}
+else
+  echo "NAS tunnel: ни tunnel_key_file, ни tunnel_private_key не заданы — сплю"
+  exec sleep infinity
+fi
 
-if ! write_key; then
-  echo "NAS tunnel: tunnel_private_key невалиден даже после пересборки PEM — проверьте вставку ключа"
+if ! ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
+  body_len="$(sed 's/-----[A-Z ]*-----//g' "$key_file" | tr -d ' \r\n\t' | wc -c)"
+  echo "NAS tunnel: ключ невалиден (тело base64: ${body_len} символов, ожидается ~350)."
+  echo "NAS tunnel: надёжный путь — положите ключ файлом в /config/nas-tunnel-key и задайте tunnel_key_file: /homeassistant/nas-tunnel-key"
+  exec sleep infinity
+fi
+
+if [[ -z "$host" ]]; then
+  echo "NAS tunnel: tunnel_host не задан — сплю"
   exec sleep infinity
 fi
 

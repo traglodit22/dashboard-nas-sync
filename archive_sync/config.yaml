@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.5.1"
+version: "0.5.2"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -41,6 +41,7 @@ options:
   tunnel_user: nas-tunnel
   tunnel_remote_bind: 127.0.0.1:18125
   tunnel_private_key: ""
+  tunnel_key_file: ""
 schema:
   service_url: str
   token_file: str
@@ -65,3 +66,4 @@ schema:
   tunnel_user: match(^[a-zA-Z0-9._-]{1,32}$)
   tunnel_remote_bind: str
   tunnel_private_key: str?
+  tunnel_key_file: str?
