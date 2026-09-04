@@ -24,14 +24,38 @@ if [[ -z "$host" || -z "$private_key" ]]; then
 fi
 
 key_file=/data/tunnel_key
-printf '%s\n' "$private_key" > "$key_file"
-chmod 600 "$key_file"
+
+write_key() {
+  printf '%s\n' "$private_key" > "$key_file"
+  chmod 600 "$key_file"
+  if ssh-keygen -y -f "$key_file" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Частая поломка: YAML/форма схлопнула переводы строк в пробелы.
+  # Пересобираем PEM: срезаем маркеры, убираем пробелы/переносы, wrap по 70.
+  printf '%s' "$private_key" \
+    | sed 's/-----BEGIN OPENSSH PRIVATE KEY-----//; s/-----END OPENSSH PRIVATE KEY-----//' \
+    | tr -d ' \r\n\t' \
+    | fold -w 70 \
+    | { echo '-----BEGIN OPENSSH PRIVATE KEY-----'; cat; echo '-----END OPENSSH PRIVATE KEY-----'; } \
+    > "$key_file"
+  chmod 600 "$key_file"
+  ssh-keygen -y -f "$key_file" >/dev/null 2>&1
+}
+
+if ! write_key; then
+  echo "NAS tunnel: tunnel_private_key невалиден даже после пересборки PEM — проверьте вставку ключа"
+  exec sleep infinity
+fi
 
 echo "NAS tunnel: ${remote_bind} на ${host} → 127.0.0.1:8099"
 
 while true; do
   ssh -N -T \
     -i "$key_file" \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o PreferredAuthentications=publickey \
     -o StrictHostKeyChecking=accept-new \
     -o ServerAliveInterval=20 \
     -o ServerAliveCountMax=3 \
