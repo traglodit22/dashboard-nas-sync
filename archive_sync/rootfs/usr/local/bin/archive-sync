@@ -130,7 +130,8 @@ process_item() {
   # Файл проверялся хэшем при первой закачке, здесь достаточно размера.
   if [[ -f "$destination" ]] && [[ "$(stat -c '%s' "$destination" 2>/dev/null)" == "$size_bytes" ]]; then
     jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
-      '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end)}' \
+      --arg path "$logical_path" \
+      '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end), path: $path}' \
       > "$results_dir/$file_id.ok"
     return 0
   fi
@@ -166,7 +167,8 @@ process_item() {
   fi
   printf 'stored %s\n' "$logical_path"
   jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
-    '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end)}' \
+    --arg path "$logical_path" \
+    '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end), path: $path}' \
     > "$results_dir/$file_id.ok"
 }
 
