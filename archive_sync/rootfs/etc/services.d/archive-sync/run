@@ -8,8 +8,6 @@ worker_id="$(jq -r '.worker_id' "$options")"
 category="$(jq -r '.category' "$options")"
 batch_size="$(jq -r '.batch_size' "$options")"
 parallel_downloads="$(jq -r '.parallel_downloads // 4' "$options")"
-cloud_sync_enabled="$(jq -r '.cloud_sync_enabled // false' "$options")"
-cloud_parallel_downloads="$(jq -r '.cloud_parallel_downloads // 2' "$options")"
 destination_root="$(jq -r '.destination_root' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 auto_start="$(jq -r '.auto_start' "$options")"
@@ -205,12 +203,9 @@ supervise_worker() {
   done
 }
 
+# Заметки (cloud) на NAS-primary у Dashboard: воркер cloud-синка убран (v0.7.0).
 supervise_worker "$category" "$worker_id" "$parallel_downloads" "/data/state-$category.json" "true" &
 worker_pids="$!"
-if [[ "$cloud_sync_enabled" == "true" && "$category" != "cloud" ]]; then
-  supervise_worker "cloud" "${worker_id}-cloud" "$cloud_parallel_downloads" "/data/state-cloud.json" "false" &
-  worker_pids="$worker_pids $!"
-fi
 
 # shellcheck disable=SC2086
 wait $worker_pids || true
