@@ -14,9 +14,14 @@ fi
 
 files_token_file="$(jq -r '.files_token_file // ""' "$options")"
 
+tls_port="$(jq -r '.tls_port // 8443' "$options")"
+tls_cert_dir="$(jq -r '.tls_cert_dir // "/share/NAS/.tls/nas.plansolo.ru"' "$options")"
+
 export NAS_SYNC_TOKEN_FILE="$token_file"
 export NAS_FILES_TOKEN_FILE="$files_token_file"
 export NAS_FILES_ENABLED="true"
 export NAS_FILES_ROOT="$files_root"
+export NAS_TLS_PORT="$tls_port"
+export NAS_TLS_CERT_DIR="$tls_cert_dir"
 
 exec archive-sync-api

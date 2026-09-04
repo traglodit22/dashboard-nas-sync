@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.5.6"
+version: "0.6.0"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -12,8 +12,10 @@ init: false
 webui: http://[HOST]:[PORT:8099]
 ports:
   8099/tcp: 8099
+  8443/tcp: 8443
 ports_description:
   8099/tcp: file API (read/write under destination_root, Bearer token)
+  8443/tcp: file API over HTTPS for LAN browsers (needs cert in tls_cert_dir)
 map:
   - homeassistant_config:rw
   - share:rw
@@ -36,6 +38,8 @@ options:
   files_enabled: false
   files_root: /share/NAS
   files_token_file: /homeassistant/.nas-files-token
+  tls_port: 8443
+  tls_cert_dir: /share/NAS/.tls/nas.plansolo.ru
   tunnel_enabled: false
   tunnel_host: ""
   tunnel_port: 22
@@ -62,6 +66,8 @@ schema:
   files_enabled: bool
   files_root: str
   files_token_file: str
+  tls_port: int(1,65535)
+  tls_cert_dir: str
   tunnel_enabled: bool
   tunnel_host: str?
   tunnel_port: int(1,65535)

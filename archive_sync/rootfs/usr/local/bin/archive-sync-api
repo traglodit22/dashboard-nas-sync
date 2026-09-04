@@ -9,9 +9,13 @@ Endpoints:
 All endpoints require the same Bearer token as sync control.
 """
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import ssl
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,7 +28,38 @@ EXTRA_TOKEN_FILE = os.environ.get("NAS_FILES_TOKEN_FILE", "")
 FILES_ENABLED = os.environ.get("NAS_FILES_ENABLED", "false").lower() == "true"
 FILES_ROOT = os.path.realpath(os.environ.get("NAS_FILES_ROOT", "/share/NAS"))
 
+# HTTPS для LAN-браузеров (mixed content: https-дашборд не может ходить на http).
+TLS_PORT = int(os.environ.get("NAS_TLS_PORT", "8443"))
+TLS_CERT_DIR = os.environ.get("NAS_TLS_CERT_DIR", "/share/NAS/.tls/nas.plansolo.ru")
+TLS_CERT = os.path.join(TLS_CERT_DIR, "fullchain.pem")
+TLS_KEY = os.path.join(TLS_CERT_DIR, "privkey.pem")
+
 CHUNK = 256 * 1024
+
+
+def _tokens():
+    out = []
+    for path in (TOKEN_FILE, EXTRA_TOKEN_FILE):
+        tok = _read_token(path)
+        if tok:
+            out.append(tok)
+    return out
+
+
+def valid_signature(path, exp, sig):
+    """Подписанные read-only ссылки для браузера: HMAC(files token, path|exp)."""
+    try:
+        exp_i = int(exp)
+    except (TypeError, ValueError):
+        return False
+    if exp_i < int(time.time()):
+        return False
+    payload = f"{path}|{exp_i}".encode("utf-8")
+    for tok in _tokens():
+        want = hmac.new(tok.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+        if secrets.compare_digest(sig or "", want):
+            return True
+    return False
 
 
 def read_state():
@@ -61,15 +96,21 @@ def _read_token(path):
 
 def authorized(request):
     header = request.headers.get("Authorization", "")
-    if not header.startswith("Bearer "):
-        return False
-    given = header[7:].strip()
-    for path in (TOKEN_FILE, EXTRA_TOKEN_FILE):
-        if not path:
-            continue
-        expected = _read_token(path)
-        if expected and secrets.compare_digest(given, expected):
-            return True
+    if header.startswith("Bearer "):
+        given = header[7:].strip()
+        for expected in _tokens():
+            if secrets.compare_digest(given, expected):
+                return True
+    # Подписанная read-only ссылка (только чтение файлов/статуса).
+    if request.command in ("GET", "HEAD"):
+        parsed = urllib.parse.urlparse(request.path)
+        if parsed.path.startswith("/files/"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            sig = (qs.get("sig") or [""])[0]
+            exp = (qs.get("exp") or [""])[0]
+            rel = urllib.parse.unquote(parsed.path[len("/files/"):])
+            if valid_signature(rel, exp, sig):
+                return True
     return False
 
 
@@ -139,6 +180,10 @@ class Handler(BaseHTTPRequestHandler):
     # --- sync control (existing) ---
 
     def do_GET(self):
+        parsed0 = urllib.parse.urlparse(self.path)
+        if parsed0.path == "/api/ping":
+            self.send_json(200, {"ok": True})
+            return
         if not self._guard():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -337,4 +382,33 @@ def md5_of(path):
 
 server = ThreadingHTTPServer(("0.0.0.0", 8099), Handler)
 server.daemon_threads = True
+
+if os.path.isfile(TLS_CERT) and os.path.isfile(TLS_KEY):
+    tls_server = ThreadingHTTPServer(("0.0.0.0", TLS_PORT), Handler)
+    tls_server.daemon_threads = True
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+    tls_server.socket = ctx.wrap_socket(tls_server.socket, server_side=True)
+    threading.Thread(target=tls_server.serve_forever, daemon=True).start()
+    print(f"TLS file API on :{TLS_PORT} ({TLS_CERT_DIR})")
+
+    # cert обновляется через file API (deploy hook certbot) — перечитываем рестартом
+    def _watch_cert():
+        try:
+            mtime = os.path.getmtime(TLS_CERT)
+        except OSError:
+            return
+        while True:
+            time.sleep(300)
+            try:
+                if os.path.getmtime(TLS_CERT) != mtime:
+                    print("TLS cert changed — restarting service", flush=True)
+                    os._exit(0)
+            except OSError:
+                pass
+
+    threading.Thread(target=_watch_cert, daemon=True).start()
+else:
+    print(f"TLS disabled: нет {TLS_CERT}")
+
 server.serve_forever()
