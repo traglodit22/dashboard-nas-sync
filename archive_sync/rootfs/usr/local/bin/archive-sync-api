@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Archive Sync add-on HTTP API (file server + sync control proxy).
+
+Endpoints:
+  /api/status, /api/start|pause|stop|resume — sync control (existing)
+  /files/<path>  — file read/write under FILES_ROOT (GET/HEAD/PUT/DELETE)
+  /api/files/stat?path=..., /api/files/list?path=...
+
+All endpoints require the same Bearer token as sync control.
+"""
+import hashlib
+import json
+import os
+import secrets
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = "/data/state.json"
+CONTROL = "/data/control"
+TOKEN_FILE = os.environ.get("NAS_SYNC_TOKEN_FILE", "/homeassistant/.archive-sync-token")
+
+FILES_ENABLED = os.environ.get("NAS_FILES_ENABLED", "false").lower() == "true"
+FILES_ROOT = os.path.realpath(os.environ.get("NAS_FILES_ROOT", "/share/NAS"))
+
+CHUNK = 256 * 1024
+
+
+def read_state():
+    # Worker пишет /data/state-<category>.json; /data/state.json — legacy.
+    states = {}
+    import glob
+    for path in sorted(glob.glob("/data/state*.json")):
+        key = os.path.basename(path)[len("state"):].rsplit(".json", 1)[0].lstrip("-") or "default"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                states[key] = json.load(f)
+        except Exception:
+            continue
+    if not states:
+        return {"status": "idle", "synced": 0, "error": None}
+    if "default" in states:
+        return states["default"]
+    return {"workers": states}
+
+
+def write_control(value):
+    os.makedirs(os.path.dirname(CONTROL), exist_ok=True)
+    with open(CONTROL, "w", encoding="utf-8") as f:
+        f.write(value)
+
+
+def authorized(request):
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            expected = f.read().strip()
+    except OSError:
+        return False
+    return bool(expected) and secrets.compare_digest(header[7:].strip(), expected)
+
+
+def resolve_file_path(raw_path):
+    """URL path under /files/ → absolute path inside FILES_ROOT, or None."""
+    rel = urllib.parse.unquote(raw_path)
+    rel = rel.lstrip("/")
+    if not rel or "\x00" in rel:
+        return None
+    candidate = os.path.realpath(os.path.join(FILES_ROOT, rel))
+    if candidate != FILES_ROOT and not candidate.startswith(FILES_ROOT + os.sep):
+        return None
+    return candidate
+
+
+def parse_range(header, size):
+    """'bytes=a-b' → (start, end) inclusive, or None. Suffix ranges supported."""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[6:].split(",", 1)[0].strip()
+    if "-" not in spec:
+        return None
+    start_s, end_s = spec.split("-", 1)
+    try:
+        if start_s == "":
+            length = int(end_s)
+            if length <= 0:
+                return None
+            return (max(0, size - length), size - 1)
+        start = int(start_s)
+        end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start > end or start >= size:
+        return None
+    return (start, min(end, size - 1))
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args):
+        pass
+
+    def send_json(self, code, payload):
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    # --- auth dispatch ---
+
+    def _guard(self):
+        if not authorized(self):
+            self.send_json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def _guard_files(self):
+        if not FILES_ENABLED:
+            self.send_json(403, {"error": "files API disabled"})
+            return False
+        return True
+
+    # --- sync control (existing) ---
+
+    def do_GET(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/status":
+            self.send_json(200, read_state())
+            return
+        if parsed.path == "/api/files/stat":
+            if not self._guard_files():
+                return
+            return self._files_stat(parsed)
+        if parsed.path == "/api/files/list":
+            if not self._guard_files():
+                return
+            return self._files_list(parsed)
+        if parsed.path.startswith("/files/"):
+            if not self._guard_files():
+                return
+            return self._files_download(parsed.path[len("/files/"):], head_only=False)
+        self.send_json(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/files/"):
+            if not self._guard_files():
+                return
+            return self._files_download(parsed.path[len("/files/"):], head_only=True)
+        self.send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._guard():
+            return
+        if self.path not in ("/api/start", "/api/pause", "/api/stop", "/api/resume"):
+            self.send_json(404, {"error": "not found"})
+            return
+        write_control(self.path.rsplit("/", 1)[-1])
+        self.send_json(202, {"ok": True, "command": self.path.rsplit("/", 1)[-1]})
+
+    # --- file API ---
+
+    def _files_stat(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        target = resolve_file_path((qs.get("path") or [""])[0])
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        if not os.path.isfile(target):
+            self.send_json(404, {"error": "not found"})
+            return
+        st = os.stat(target)
+        payload = {"size": st.st_size, "mtime": int(st.st_mtime)}
+        if (qs.get("md5") or [""])[0] == "1":
+            payload["md5"] = md5_of(target)
+        self.send_json(200, payload)
+
+    def _files_list(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        target = resolve_file_path((qs.get("path") or [""])[0])
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        if not os.path.isdir(target):
+            self.send_json(404, {"error": "not found"})
+            return
+        entries = []
+        for name in sorted(os.listdir(target)):
+            full = os.path.join(target, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            entries.append({
+                "name": name,
+                "dir": os.path.isdir(full),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+            })
+        self.send_json(200, {"entries": entries})
+
+    def _files_download(self, rel, head_only):
+        target = resolve_file_path(rel)
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        if not os.path.isfile(target):
+            self.send_json(404, {"error": "not found"})
+            return
+        size = os.path.getsize(target)
+        rng = parse_range(self.headers.get("Range"), size)
+        if rng is None:
+            start, end, code = 0, size - 1, 200
+        else:
+            start, end, code = rng[0], rng[1], 206
+        length = max(0, end - start + 1) if size > 0 else 0
+        self.send_response(code)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if head_only or length == 0:
+            return
+        with open(target, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                remaining -= len(chunk)
+
+    def do_PUT(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/files/"):
+            self.send_json(404, {"error": "not found"})
+            return
+        if not self._guard_files():
+            return
+        target = resolve_file_path(parsed.path[len("/files/"):])
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.send_json(411, {"error": "Content-Length required"})
+            return
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.nas-upload.tmp.{os.getpid()}"
+        md5 = hashlib.md5()
+        remaining = length
+        try:
+            with open(tmp, "wb") as out:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(CHUNK, remaining))
+                    if not chunk:
+                        raise IOError("client disconnected mid-upload")
+                    out.write(chunk)
+                    md5.update(chunk)
+                    remaining -= len(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, target)
+        except Exception as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            self.send_json(500, {"error": f"upload failed: {exc}"})
+            return
+        self.send_json(201, {"ok": True, "size": length, "md5": md5.hexdigest()})
+
+    def do_DELETE(self):
+        if not self._guard():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/files/"):
+            self.send_json(404, {"error": "not found"})
+            return
+        if not self._guard_files():
+            return
+        target = resolve_file_path(parsed.path[len("/files/"):])
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        if not os.path.exists(target):
+            self.send_json(404, {"error": "not found"})
+            return
+        if os.path.isdir(target):
+            self.send_json(400, {"error": "is a directory"})
+            return
+        os.unlink(target)
+        self.send_json(200, {"ok": True})
+
+
+def md5_of(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+server = ThreadingHTTPServer(("0.0.0.0", 8099), Handler)
+server.daemon_threads = True
+server.serve_forever()

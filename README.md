@@ -34,3 +34,16 @@ worker never receives object-storage credentials.
 Version 0.3.2 adds multi-project backup pull. See
 [`NAS_BACKUP_PROTOCOL.md`](NAS_BACKUP_PROTOCOL.md) for the public project API
 contract and the `backup_projects_json` configuration format.
+
+## File API and reverse tunnel (v0.5.0)
+
+Optional HTTP file server for the synced files (read/write under `files_root`,
+default `/share/NAS`), same Bearer token as the sync worker:
+
+- `files_enabled: true` — serves `GET/HEAD/PUT/DELETE /files/<path>` on port 8099
+  (Range supported, atomic uploads with MD5 receipt).
+- `tunnel_enabled: true` + `tunnel_host` + `tunnel_private_key` — reverse SSH
+  tunnel so the Dashboard VPS can reach the file API via `tunnel_remote_bind`
+  (default `127.0.0.1:18125`) when the user is away from the home LAN.
+  Use a dedicated locked-down SSH account on the VPS
+  (`permitlisten="127.0.0.1:18125"`, no shell).

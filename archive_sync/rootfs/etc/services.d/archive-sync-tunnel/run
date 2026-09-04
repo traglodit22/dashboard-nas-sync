@@ -1,0 +1,45 @@
+#!/usr/bin/with-contenv bash
+# Reverse SSH tunnel: VPS loopback → file API этого add-on (порт 8099).
+# Даёт Dashboard доступ к NAS-файлам, когда пользователь не в домашней сети.
+# s6 перезапускает сервис при выходе; дополнительный backoff — внутри.
+set -uo pipefail
+
+options=/data/options.json
+enabled="$(jq -r '.tunnel_enabled // false' "$options")"
+
+if [[ "$enabled" != "true" ]]; then
+  echo "NAS tunnel disabled (tunnel_enabled != true)"
+  exec sleep infinity
+fi
+
+host="$(jq -r '.tunnel_host // empty' "$options")"
+port="$(jq -r '.tunnel_port // 22' "$options")"
+user="$(jq -r '.tunnel_user // "nas-tunnel"' "$options")"
+remote_bind="$(jq -r '.tunnel_remote_bind // "127.0.0.1:18125"' "$options")"
+private_key="$(jq -r '.tunnel_private_key // empty' "$options")"
+
+if [[ -z "$host" || -z "$private_key" ]]; then
+  echo "NAS tunnel: tunnel_host/tunnel_private_key не заданы — сплю"
+  exec sleep infinity
+fi
+
+key_file=/data/tunnel_key
+printf '%s\n' "$private_key" > "$key_file"
+chmod 600 "$key_file"
+
+echo "NAS tunnel: ${remote_bind} на ${host} → 127.0.0.1:8099"
+
+while true; do
+  ssh -N -T \
+    -i "$key_file" \
+    -o StrictHostKeyChecking=accept-new \
+    -o ServerAliveInterval=20 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o ConnectTimeout=15 \
+    -p "$port" \
+    -R "${remote_bind}:127.0.0.1:8099" \
+    "${user}@${host}"
+  echo "NAS tunnel: ssh вышел ($?), рестарт через 15с"
+  sleep 15
+done

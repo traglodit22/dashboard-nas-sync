@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.4.0"
+version: "0.5.0"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -9,6 +9,11 @@ arch:
 startup: services
 boot: auto
 init: false
+webui: http://[HOST]:[PORT:8099]
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: file API (read/write under destination_root, Bearer token)
 map:
   - homeassistant_config:rw
   - share:rw
@@ -28,6 +33,14 @@ options:
   backup_destination_root: /share/NAS/backups
   backup_project_name: dashboard
   backup_projects_json: "[]"
+  files_enabled: false
+  files_root: /share/NAS
+  tunnel_enabled: false
+  tunnel_host: ""
+  tunnel_port: 22
+  tunnel_user: nas-tunnel
+  tunnel_remote_bind: 127.0.0.1:18125
+  tunnel_private_key: ""
 schema:
   service_url: str
   token_file: str
@@ -44,3 +57,11 @@ schema:
   backup_destination_root: str
   backup_project_name: match(^[a-z0-9][a-z0-9_-]{0,63}$)
   backup_projects_json: str
+  files_enabled: bool
+  files_root: str
+  tunnel_enabled: bool
+  tunnel_host: str?
+  tunnel_port: int(1,65535)
+  tunnel_user: match(^[a-zA-Z0-9._-]{1,32}$)
+  tunnel_remote_bind: str
+  tunnel_private_key: str?

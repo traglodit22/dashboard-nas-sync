@@ -1,0 +1,19 @@
+#!/usr/bin/with-contenv bash
+# File API (read/write /share по HTTP, Bearer token) для доступа Dashboard к NAS.
+set -euo pipefail
+
+options=/data/options.json
+files_enabled="$(jq -r '.files_enabled // false' "$options")"
+files_root="$(jq -r '.files_root // "/share/NAS"' "$options")"
+token_file="$(jq -r '.token_file' "$options")"
+
+if [[ "$files_enabled" != "true" ]]; then
+  echo "File API disabled (files_enabled != true)"
+  exec sleep infinity
+fi
+
+export NAS_SYNC_TOKEN_FILE="$token_file"
+export NAS_FILES_ENABLED="true"
+export NAS_FILES_ROOT="$files_root"
+
+exec archive-sync-api
