@@ -198,6 +198,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._guard_files():
                 return
             return self._files_list(parsed)
+        if parsed.path == "/api/files/exists":
+            if not self._guard_files():
+                return
+            return self._files_exists(parsed)
         if parsed.path.startswith("/files/"):
             if not self._guard_files():
                 return
@@ -225,6 +229,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- file API ---
 
+    def _files_exists(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        target = resolve_file_path((qs.get("path") or [""])[0])
+        if target is None:
+            self.send_json(400, {"error": "bad path"})
+            return
+        self.send_json(200, {"exists": os.path.exists(target)})
+
     def _files_stat(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         target = resolve_file_path((qs.get("path") or [""])[0])
@@ -249,8 +261,13 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isdir(target):
             self.send_json(404, {"error": "not found"})
             return
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            limit = int((qs.get("limit") or ["0"])[0])
+        except ValueError:
+            limit = 0
         entries = []
-        for name in sorted(os.listdir(target)):
+        for name in os.listdir(target):
             full = os.path.join(target, name)
             try:
                 st = os.lstat(full)
@@ -262,6 +279,9 @@ class Handler(BaseHTTPRequestHandler):
                 "size": st.st_size,
                 "mtime": int(st.st_mtime),
             })
+        entries.sort(key=lambda e: e["mtime"], reverse=True)
+        if limit > 0:
+            entries = entries[:limit]
         self.send_json(200, {"entries": entries})
 
     def _files_download(self, rel, head_only):
