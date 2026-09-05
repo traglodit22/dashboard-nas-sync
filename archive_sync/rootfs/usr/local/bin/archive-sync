@@ -16,10 +16,12 @@ trap 'rc=$?; printf "archive sync shell error at line %s: %s (exit %s)\n" "$LINE
 download_with_resume() {
   local download_url="$1" destination="$2" attempt
 
-  for attempt in 1 2 3; do
+  # Большие файлы (видео по 9+ ГБ): без --max-time, но с прогресс-сторожкой —
+  # если скорость падает ниже 100 КБ/с на 5 минут, curl обрывает и мы докачиваем.
+  for attempt in 1 2 3 4 5; do
     if curl --fail --silent --show-error --location \
       --connect-timeout 30 \
-      --max-time "$NAS_DOWNLOAD_TIMEOUT_SECONDS" \
+      --speed-time 300 --speed-limit 102400 \
       --retry 2 --retry-delay 5 --retry-connrefused \
       --continue-at - \
       "$download_url" --output "$destination"; then
