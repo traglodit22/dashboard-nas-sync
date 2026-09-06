@@ -123,54 +123,80 @@ update_state() {
 # Скачивает один файл манифеста параллельно с другими. Никогда не падает:
 # результат — файл <fileId>.ok (строка JSON для completion) или
 # <fileId>.err (причина для /missing) в $results_dir.
+# Аргументы: file_id logical_path size_bytes content_hash download_url
+#            preview_logical_path preview_download_url
+# download_url/preview_download_url могут быть "null" — тогда этот объект
+# уже на NAS и качать не нужно (файл попал в манифест из-за другого объекта).
 process_item() {
   local file_id="$1" logical_path="$2" size_bytes="$3" content_hash="$4" download_url="$5"
+  local preview_logical_path="$6" preview_download_url="$7"
   local destination="$NAS_SYNC_ROOT/$logical_path"
   mkdir -p "$(dirname "$destination")"
 
-  # Уже скачан ранее (рестарт после сбоя в середине пачки) — пропускаем.
-  # Файл проверялся хэшем при первой закачке, здесь достаточно размера.
-  if [[ -f "$destination" ]] && [[ "$(stat -c '%s' "$destination" 2>/dev/null)" == "$size_bytes" ]]; then
-    jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
-      --arg path "$logical_path" \
-      '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end), path: $path}' \
-      > "$results_dir/$file_id.ok"
-    return 0
-  fi
-
-  local temporary="${destination}.archive-sync.tmp.${file_id}"
-  rm -f "$temporary"
-  printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
-  if ! download_with_resume "$download_url" "$temporary"; then
-    rm -f "$temporary"
-    printf 'GCS download returned HTTP 404 or another terminal error' > "$results_dir/$file_id.err"
-    return 0
-  fi
-  local actual_size
-  actual_size="$(stat -c '%s' "$temporary")"
-  if [[ "$actual_size" != "$size_bytes" ]]; then
-    rm -f "$temporary"
-    printf 'size mismatch: expected %s, got %s' "$size_bytes" "$actual_size" > "$results_dir/$file_id.err"
-    return 0
-  fi
-  if [[ -n "$content_hash" ]]; then
-    local actual_hash
-    actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"
-    if [[ "$actual_hash" != "$content_hash" ]]; then
+  if [[ "$download_url" != "null" && -n "$download_url" ]]; then
+    # Уже скачан ранее (рестарт после сбоя в середине пачки) — пропускаем.
+    # Файл проверялся хэшем при первой закачке, здесь достаточно размера.
+    if [[ ! -f "$destination" ]] || [[ "$(stat -c '%s' "$destination" 2>/dev/null)" != "$size_bytes" ]]; then
+      local temporary="${destination}.archive-sync.tmp.${file_id}"
       rm -f "$temporary"
-      printf 'hash mismatch: expected %s, got %s' "$content_hash" "$actual_hash" > "$results_dir/$file_id.err"
-      return 0
+      printf 'downloading %s (expected %s bytes)\n' "$logical_path" "$size_bytes"
+      if ! download_with_resume "$download_url" "$temporary"; then
+        rm -f "$temporary"
+        printf 'GCS download returned HTTP 404 or another terminal error' > "$results_dir/$file_id.err"
+        return 0
+      fi
+      local actual_size
+      actual_size="$(stat -c '%s' "$temporary")"
+      if [[ "$actual_size" != "$size_bytes" ]]; then
+        rm -f "$temporary"
+        printf 'size mismatch: expected %s, got %s' "$size_bytes" "$actual_size" > "$results_dir/$file_id.err"
+        return 0
+      fi
+      if [[ -n "$content_hash" && "$content_hash" != "null" ]]; then
+        local actual_hash
+        actual_hash="$(sha256sum "$temporary" | cut -d' ' -f1)"
+        if [[ "$actual_hash" != "$content_hash" ]]; then
+          rm -f "$temporary"
+          printf 'hash mismatch: expected %s, got %s' "$content_hash" "$actual_hash" > "$results_dir/$file_id.err"
+          return 0
+        fi
+      fi
+      if ! mv -f -- "$temporary" "$destination"; then
+        rm -f "$temporary"
+        printf 'move failed' > "$results_dir/$file_id.err"
+        return 0
+      fi
+      printf 'stored %s\n' "$logical_path"
     fi
   fi
-  if ! mv -f -- "$temporary" "$destination"; then
-    rm -f "$temporary"
-    printf 'move failed' > "$results_dir/$file_id.err"
-    return 0
+
+  # Превью (WebP, мелкое): качаем без проверки хэша — в БД его нет.
+  local preview_path_json="null"
+  if [[ "$preview_download_url" != "null" && -n "$preview_download_url" && "$preview_logical_path" != "null" && -n "$preview_logical_path" ]]; then
+    local preview_destination="$NAS_SYNC_ROOT/$preview_logical_path"
+    mkdir -p "$(dirname "$preview_destination")"
+    if [[ ! -f "$preview_destination" ]]; then
+      local preview_tmp="${preview_destination}.archive-sync.tmp.${file_id}"
+      rm -f "$preview_tmp"
+      if curl --fail --silent --show-error --location \
+        --connect-timeout 30 --max-time 300 --retry 2 --retry-delay 5 \
+        "$preview_download_url" --output "$preview_tmp"; then
+        mv -f -- "$preview_tmp" "$preview_destination"
+        printf 'stored preview %s\n' "$preview_logical_path"
+      else
+        rm -f "$preview_tmp"
+        # Превью необязательно: ошибка не блокирует подтверждение оригинала.
+        printf 'preview download failed, skipping: %s\n' "$preview_logical_path" >&2
+      fi
+    fi
+    if [[ -f "$preview_destination" ]]; then
+      preview_path_json="$(jq -nc --arg p "$preview_logical_path" '$p')"
+    fi
   fi
-  printf 'stored %s\n' "$logical_path"
+
   jq -nc --arg fileId "$file_id" --argjson sizeBytes "$size_bytes" --arg contentHash "$content_hash" \
-    --arg path "$logical_path" \
-    '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" then null else . end), path: $path}' \
+    --arg path "$logical_path" --argjson previewPath "$preview_path_json" \
+    '{fileId: $fileId, sizeBytes: $sizeBytes, contentHash: ($contentHash | if . == "" or . == "null" then null else . end), path: $path, previewPath: $previewPath}' \
     > "$results_dir/$file_id.ok"
 }
 
@@ -218,11 +244,15 @@ while :; do
     size_bytes="$(jq -r '.sizeBytes // empty' <<< "$item")"
     content_hash="$(jq -r '.contentHash // empty' <<< "$item")"
     download_url="$(jq -r '.downloadUrl // empty' <<< "$item")"
-    [[ -n "$file_id" && -n "$logical_path" && -n "$download_url" ]] || fail manifest "invalid item"
+    preview_logical_path="$(jq -r '.previewLogicalPath // empty' <<< "$item")"
+    preview_download_url="$(jq -r '.previewDownloadUrl // empty' <<< "$item")"
+    [[ -n "$file_id" && -n "$logical_path" ]] || fail manifest "invalid item"
+    [[ -n "$download_url" || -n "$preview_download_url" ]] || fail manifest "invalid item: no urls"
     while (( $(jobs -pr | wc -l) >= NAS_SYNC_PARALLEL )); do
       wait -n || true
     done
-    process_item "$file_id" "$logical_path" "$size_bytes" "$content_hash" "$download_url" &
+    process_item "$file_id" "$logical_path" "$size_bytes" "$content_hash" "$download_url" \
+      "$preview_logical_path" "$preview_download_url" &
   done < <(jq -r '.items[] | @base64' "$manifest")
   wait
 
