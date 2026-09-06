@@ -87,8 +87,9 @@ process_archive() {
   # Собираем список медиафайлов
   local list="$work_dir/.files.list"
   find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
-  local total
-  total="$(grep -cz '' "$list" 2>/dev/null || printf '0')"
+  # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
+  local total=0 f
+  while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
   report running "$(basename "$archive")" 0 "$total"
 
   local file hash existing captured mime
