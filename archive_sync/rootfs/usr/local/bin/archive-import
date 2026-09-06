@@ -25,11 +25,21 @@ update_state() {
 }
 
 # Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
+# archives_left — сколько zip ещё ждёт в папке (без текущего).
 report() {
-  local status="$1" archive="$2" done="$3" total="$4"
+  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}"
   curl -sf "${AUTH[@]}" \
-    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
+}
+
+# Сколько zip-архивов осталось в папке (для общего прогресса).
+count_pending_archives() {
+  local n=0 a
+  shopt -s nullglob nocaseglob
+  for a in "$IMPORT_ROOT"/*.zip; do n=$((n + 1)); done
+  shopt -u nocaseglob
+  printf '%s' "$n"
 }
 
 # Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
@@ -90,7 +100,9 @@ process_archive() {
   # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
   local total=0 f
   while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
-  report running "$(basename "$archive")" 0 "$total"
+  # -1: текущий архив уже в работе, не считаем его в «осталось»
+  local pending=$(( $(count_pending_archives) - 1 ))
+  report running "$(basename "$archive")" 0 "$total" "$pending"
 
   local file hash existing captured mime
   while IFS= read -r -d '' file; do
@@ -102,7 +114,7 @@ process_archive() {
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
       skipped=$((skipped + 1))
-      report running "$(basename "$archive")" $((done + skipped + failed)) "$total"
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
       continue
     fi
     captured="$(capture_date_for "$file")"
@@ -120,7 +132,7 @@ process_archive() {
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $(basename "$file")" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-    report running "$(basename "$archive")" $((done + skipped + failed)) "$total"
+    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
   done < "$list"
 
   rm -rf "$work_dir"
@@ -128,7 +140,7 @@ process_archive() {
   mv -f -- "$archive" "$IMPORT_ROOT/.done/$(basename "$archive")"
   log "done $(basename "$archive"): imported=$done skipped=$skipped failed=$failed"
   update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-  report completed "$(basename "$archive")" "$total" "$total"
+  report completed "$(basename "$archive")" "$total" "$total" "$pending"
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
