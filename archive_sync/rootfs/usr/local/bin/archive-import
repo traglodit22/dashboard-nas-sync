@@ -33,13 +33,9 @@ report() {
     >/dev/null 2>&1 || true
 }
 
-# Сколько zip-архивов осталось в папке (для общего прогресса).
+# Сколько zip-архивов осталось (рекурсивно, включая подпапки).
 count_pending_archives() {
-  local n=0 a
-  shopt -s nullglob nocaseglob
-  for a in "$IMPORT_ROOT"/*.zip; do n=$((n + 1)); done
-  shopt -u nocaseglob
-  printf '%s' "$n"
+  find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
 }
 
 # Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
@@ -137,16 +133,21 @@ process_archive() {
 
   rm -rf "$work_dir"
   mkdir -p "$IMPORT_ROOT/.done"
-  mv -f -- "$archive" "$IMPORT_ROOT/.done/$(basename "$archive")"
-  log "done $(basename "$archive"): imported=$done skipped=$skipped failed=$failed"
-  update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-  report completed "$(basename "$archive")" "$total" "$total" "$pending"
+  # Сохраняем относительный путь подпапки, чтобы одинаковые имена архивов не конфликтовали.
+  local rel_path done_path done_dir
+  rel_path="${archive#"$IMPORT_ROOT"/}"
+  done_path="$IMPORT_ROOT/.done/$rel_path"
+  done_dir="$(dirname "$done_path")"
+  mkdir -p "$done_dir"
+  mv -f -- "$archive" "$done_path"
+  log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
+  update_state "$rel_path" "$done" "$skipped" "$failed"
+  report completed "$rel_path" "$total" "$total" "$pending"
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
-shopt -s nullglob nocaseglob
-archives=("$IMPORT_ROOT"/*.zip)
-shopt -u nocaseglob
+# Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
+mapfile -t archives < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
 if (( ${#archives[@]} == 0 )); then
   log "no archives in $IMPORT_ROOT"
   exit 0
