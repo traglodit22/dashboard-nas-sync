@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Импорт Apple-архивов (zip) в галерею дашборда.
+# Берёт первый .zip из $IMPORT_ROOT, распаковывает, загружает медиа через API,
+# помечает архив обработанным. Даты: EXIF → JSON-спутник Apple → имя файла.
+set -euo pipefail
+
+: "${DASHBOARD_URL:?service URL is required}"
+: "${NAS_SYNC_TOKEN:?access token is required}"
+: "${IMPORT_ROOT:=/share/NAS/apple-import}"
+: "${IMPORT_PARALLEL:=2}"
+: "${IMPORT_STATE_FILE:=/data/import-state.json}"
+
+API="${DASHBOARD_URL%/}/api/sync/nas/import"
+CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
+AUTH=(-H "Authorization: Bearer $NAS_SYNC_TOKEN" -H "X-NAS-Agent-Id: archive-import")
+
+log() { printf '[import] %s\n' "$*" >&2; }
+fail() { printf '[import] FAILED at %s: %s\n' "$1" "$2" >&2; exit 1; }
+
+update_state() {
+  printf '{"archive":"%s","done":%s,"skipped":%s,"failed":%s,"updatedAt":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)" > "$IMPORT_STATE_FILE.tmp" 2>/dev/null \
+    && mv -f "$IMPORT_STATE_FILE.tmp" "$IMPORT_STATE_FILE" 2>/dev/null || true
+}
+
+# Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
+capture_date_for() {
+  local file="$1" base dt
+  # EXIF (exiftool): DateTimeOriginal / CreateDate
+  dt="$(exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
+  if [[ -n "$dt" ]]; then printf '%s' "$dt"; return 0; fi
+  # JSON-спутник Apple Takeout: <name>.json рядом
+  base="${file%.*}"
+  for json in "$file.json" "$base.json"; do
+    if [[ -f "$json" ]]; then
+      dt="$(jq -r '.photoTakenTime.formatted // .creationTime.formatted // empty' "$json" 2>/dev/null || true)"
+      if [[ -n "$dt" ]]; then
+        # "11 февр. 2026 г., 14:19:14 UTC" → не парсим; берём timestamp если есть
+        local ts
+        ts="$(jq -r '.photoTakenTime.timestamp // .creationTime.timestamp // empty' "$json" 2>/dev/null || true)"
+        if [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]]; then
+          printf '%s' "$(date -u -d "@$ts" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
+          return 0
+        fi
+      fi
+    fi
+  done
+  # Имя файла: IMG_20260211_141914, 2026-02-11 14.19.14, 20260211_141914
+  local name re
+  name="$(basename "$file")"
+  re='(20[0-9]{2})[-_]?([01][0-9])[-_]?([0-3][0-9])[-_ ]?([0-2][0-9])[-.:]?([0-5][0-9])[-.:]?([0-5][0-9])?'
+  if [[ "$name" =~ $re ]]; then
+    printf '%s-%s-%sT%s:%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+      "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-00}" "${BASH_REMATCH[6]:-00}"
+    return 0
+  fi
+  printf ''
+}
+
+is_media() {
+  local f
+  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$f" in
+    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+process_archive() {
+  local archive="$1" work_dir done=0 skipped=0 failed=0
+  work_dir="$(mktemp -d "$IMPORT_ROOT/.tmp.XXXXXX")"
+  log "unpacking $(basename "$archive")"
+  if ! unzip -q -o "$archive" -d "$work_dir"; then
+    rm -rf "$work_dir"
+    fail unpack "$(basename "$archive")"
+  fi
+
+  # Собираем список медиафайлов
+  local list="$work_dir/.files.list"
+  find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
+
+  local file hash existing captured mime
+  while IFS= read -r -d '' file; do
+    is_media "$file" || continue
+    hash="$(sha256sum "$file" | cut -d' ' -f1)"
+    # Дедуп против БД
+    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
+      --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
+      | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
+    if [[ -n "$existing" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    captured="$(capture_date_for "$file")"
+    # Загрузка
+    local http_code
+    http_code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+      -F "file=@$file" \
+      -F "fileName=$(basename "$file")" \
+      ${captured:+-F "capturedAt=$captured"} \
+      -F "contentHash=$hash" \
+      "$API" 2>/dev/null || echo 000)"
+    case "$http_code" in
+      200|201) done=$((done + 1)) ;;
+      000) failed=$((failed + 1)); log "upload failed (network): $(basename "$file")" ;;
+      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $(basename "$file")" ;;
+    esac
+    update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+  done < "$list"
+
+  rm -rf "$work_dir"
+  mkdir -p "$IMPORT_ROOT/.done"
+  mv -f -- "$archive" "$IMPORT_ROOT/.done/$(basename "$archive")"
+  log "done $(basename "$archive"): imported=$done skipped=$skipped failed=$failed"
+  update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+}
+
+mkdir -p "$IMPORT_ROOT/.done"
+shopt -s nullglob nocaseglob
+archives=("$IMPORT_ROOT"/*.zip)
+shopt -u nocaseglob
+if (( ${#archives[@]} == 0 )); then
+  log "no archives in $IMPORT_ROOT"
+  exit 0
+fi
+
+# По одному архиву за проход (сервис перезапускается supervisor'ом).
+process_archive "${archives[0]}"
