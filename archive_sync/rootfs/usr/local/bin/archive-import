@@ -12,6 +12,7 @@ set -euo pipefail
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
 CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
+STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
 AUTH=(-H "Authorization: Bearer $NAS_SYNC_TOKEN" -H "X-NAS-Agent-Id: archive-import")
 
 log() { printf '[import] %s\n' "$*" >&2; }
@@ -21,6 +22,14 @@ update_state() {
   printf '{"archive":"%s","done":%s,"skipped":%s,"failed":%s,"updatedAt":"%s"}\n' \
     "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)" > "$IMPORT_STATE_FILE.tmp" 2>/dev/null \
     && mv -f "$IMPORT_STATE_FILE.tmp" "$IMPORT_STATE_FILE" 2>/dev/null || true
+}
+
+# Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
+report() {
+  local status="$1" archive="$2" done="$3" total="$4"
+  curl -sf "${AUTH[@]}" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total" \
+    >/dev/null 2>&1 || true
 }
 
 # Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
@@ -78,6 +87,9 @@ process_archive() {
   # Собираем список медиафайлов
   local list="$work_dir/.files.list"
   find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
+  local total
+  total="$(grep -cz '' "$list" 2>/dev/null || printf '0')"
+  report running "$(basename "$archive")" 0 "$total"
 
   local file hash existing captured mime
   while IFS= read -r -d '' file; do
@@ -89,6 +101,7 @@ process_archive() {
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
       skipped=$((skipped + 1))
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total"
       continue
     fi
     captured="$(capture_date_for "$file")"
@@ -106,6 +119,7 @@ process_archive() {
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $(basename "$file")" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+    report running "$(basename "$archive")" $((done + skipped + failed)) "$total"
   done < "$list"
 
   rm -rf "$work_dir"
@@ -113,6 +127,7 @@ process_archive() {
   mv -f -- "$archive" "$IMPORT_ROOT/.done/$(basename "$archive")"
   log "done $(basename "$archive"): imported=$done skipped=$skipped failed=$failed"
   update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+  report completed "$(basename "$archive")" "$total" "$total"
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
