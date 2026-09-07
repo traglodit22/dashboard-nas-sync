@@ -144,6 +144,7 @@ process_archive() {
   log "starting media loop for $(basename "$archive")"
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
+    log "processing $(basename "$file")"
     hash="$(sha256sum "$file" | cut -d' ' -f1)"
     # Дедуп против БД
     if ! existing="$(check_existing_hash "$hash")"; then
