@@ -170,15 +170,18 @@ process_archive() {
     fi
     captured="$(capture_date_for "$file")"
     # Загрузка
-    local http_code file_size
+    local http_code file_size file_dir file_base
     file_size="$(stat -c%s "$file" 2>/dev/null || printf '?')"
-    log "uploading $(basename "$file") size=${file_size} bytes"
-    http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    file_dir="$(dirname "$file")"
+    file_base="$(basename "$file")"
+    log "uploading $file_base size=${file_size} bytes"
+    # cd в каталог файла: curl -F "file=@path" ломается на ',' и ';' в пути каталога.
+    http_code="$(cd "$file_dir" && curl -sS -o /dev/null -w '%{http_code}' \
       --retry 3 --retry-delay 2 --retry-all-errors \
       -m 900 \
       "${AUTH[@]}" \
-      -F "file=@$file" \
-      -F "fileName=$(basename "$file")" \
+      -F "file=@$file_base" \
+      -F "fileName=$file_base" \
       ${captured:+-F "capturedAt=$captured"} \
       -F "contentHash=$hash" \
       "$API")"
