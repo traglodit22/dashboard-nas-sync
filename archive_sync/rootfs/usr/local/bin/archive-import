@@ -93,9 +93,13 @@ process_archive() {
   # Собираем список медиафайлов
   local list="$work_dir/.files.list"
   find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
+  local all_count=0
+  while IFS= read -r -d '' _; do all_count=$((all_count + 1)); done < "$list"
+  log "unpacked $(basename "$archive"): files=$all_count"
   # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
   local total=0 f
   while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
+  log "media files in $(basename "$archive"): $total"
   # -1: текущий архив уже в работе, не считаем его в «осталось»
   local pending=$(( $(count_pending_archives) - 1 ))
   report running "$(basename "$archive")" 0 "$total" "$pending"
