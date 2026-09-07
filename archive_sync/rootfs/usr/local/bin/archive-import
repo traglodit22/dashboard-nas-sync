@@ -116,12 +116,16 @@ process_archive() {
     captured="$(capture_date_for "$file")"
     # Загрузка
     local http_code
-    http_code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
+    http_code="$(curl -s -o /dev/null -w '%{http_code}' \
+      --retry 3 --retry-delay 2 --retry-all-errors \
+      -m 900 \
+      "${AUTH[@]}" \
       -F "file=@$file" \
       -F "fileName=$(basename "$file")" \
       ${captured:+-F "capturedAt=$captured"} \
       -F "contentHash=$hash" \
-      "$API" 2>/dev/null || echo 000)"
+      "$API" 2>/dev/null)"
+    http_code="${http_code:-000}"
     case "$http_code" in
       200|201) done=$((done + 1)) ;;
       000) failed=$((failed + 1)); log "upload failed (network): $(basename "$file")" ;;
