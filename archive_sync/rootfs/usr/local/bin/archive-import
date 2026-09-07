@@ -26,11 +26,14 @@ update_state() {
 
 # Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
 # archives_left — сколько zip ещё ждёт в папке (без текущего).
+# file — текущий обрабатываемый файл (для отображения в виджете).
 report() {
-  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}"
+  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
+  local label="$archive"
+  if [[ -n "$file" ]]; then label="${label} :: ${file}"; fi
   curl -sS --retry 5 --retry-delay 2 --retry-all-errors -m 20 \
     "${AUTH[@]}" \
-    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
 }
 
@@ -67,7 +70,7 @@ pending_archives_from_list() {
 capture_date_for() {
   local file="$1" base dt
   # EXIF (exiftool): DateTimeOriginal / CreateDate
-  dt="$(timeout 30 exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
+  dt="$(timeout -k 5 30 exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
   if [[ -n "$dt" ]]; then printf '%s' "$dt"; return 0; fi
   # JSON-спутник Apple Takeout: <name>.json рядом
   base="${file%.*}"
@@ -145,7 +148,13 @@ process_archive() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     log "processing $(basename "$file")"
-    hash="$(timeout 300 sha256sum "$file" | cut -d' ' -f1)"
+    report running "$(basename "$archive")" "$((done + skipped + failed))" "$total" "$pending" "$(basename "$file")"
+    if ! hash="$(timeout -k 5 300 sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"; then
+      failed=$((failed + 1))
+      log "sha256sum failed/timeout: $(basename "$file")"
+      update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+      continue
+    fi
     # Дедуп против БД
     if ! existing="$(check_existing_hash "$hash")"; then
       failed=$((failed + 1))
