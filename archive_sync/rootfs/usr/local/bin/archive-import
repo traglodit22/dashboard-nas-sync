@@ -38,6 +38,14 @@ count_pending_archives() {
   find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
 }
 
+pending_archives_from_list() {
+  local current_archive="$1" count=0 item
+  for item in "${ARCHIVES[@]}"; do
+    [[ "$item" == "$current_archive" ]] || count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
 # Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
 capture_date_for() {
   local file="$1" base dt
@@ -100,8 +108,11 @@ process_archive() {
   local total=0 f
   while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
   log "media files in $(basename "$archive"): $total"
+  log "counting pending archives for $(basename "$archive")"
   # -1: текущий архив уже в работе, не считаем его в «осталось»
-  local pending=$(( $(count_pending_archives) - 1 ))
+  local pending
+  pending="$(pending_archives_from_list "$archive")"
+  log "pending archives for $(basename "$archive"): $pending"
   report running "$(basename "$archive")" 0 "$total" "$pending"
 
   local file hash existing captured mime first_media=''
@@ -166,11 +177,11 @@ process_archive() {
 
 mkdir -p "$IMPORT_ROOT/.done"
 # Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
-mapfile -t archives < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
-if (( ${#archives[@]} == 0 )); then
+mapfile -t ARCHIVES < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
+if (( ${#ARCHIVES[@]} == 0 )); then
   log "no archives in $IMPORT_ROOT"
   exit 0
 fi
 
 # По одному архиву за проход (сервис перезапускается supervisor'ом).
-process_archive "${archives[0]}"
+process_archive "${ARCHIVES[0]}"
