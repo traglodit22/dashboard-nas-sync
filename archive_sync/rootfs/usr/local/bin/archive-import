@@ -115,8 +115,10 @@ process_archive() {
     fi
     captured="$(capture_date_for "$file")"
     # Загрузка
-    local http_code
-    http_code="$(curl -s -o /dev/null -w '%{http_code}' \
+    local http_code file_size
+    file_size="$(stat -c%s "$file" 2>/dev/null || printf '?')"
+    log "uploading $(basename "$file") size=${file_size} bytes"
+    http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
       --retry 3 --retry-delay 2 --retry-all-errors \
       -m 900 \
       "${AUTH[@]}" \
@@ -124,7 +126,7 @@ process_archive() {
       -F "fileName=$(basename "$file")" \
       ${captured:+-F "capturedAt=$captured"} \
       -F "contentHash=$hash" \
-      "$API" 2>/dev/null)"
+      "$API")"
     http_code="${http_code:-000}"
     case "$http_code" in
       200|201) done=$((done + 1)) ;;
