@@ -104,7 +104,16 @@ process_archive() {
   local pending=$(( $(count_pending_archives) - 1 ))
   report running "$(basename "$archive")" 0 "$total" "$pending"
 
-  local file hash existing captured mime
+  local file hash existing captured mime first_media=''
+  while IFS= read -r -d '' file; do
+    if is_media "$file"; then first_media="$file"; break; fi
+  done < "$list"
+  if [[ -n "$first_media" ]]; then
+    log "first media file: $(basename "$first_media")"
+  else
+    log "first media file: none"
+  fi
+  log "starting media loop for $(basename "$archive")"
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     hash="$(sha256sum "$file" | cut -d' ' -f1)"
