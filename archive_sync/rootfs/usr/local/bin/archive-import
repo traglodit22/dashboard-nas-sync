@@ -28,9 +28,26 @@ update_state() {
 # archives_left — сколько zip ещё ждёт в папке (без текущего).
 report() {
   local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}"
-  curl -sf "${AUTH[@]}" \
+  curl -sS --retry 5 --retry-delay 2 --retry-all-errors -m 20 \
+    "${AUTH[@]}" \
     "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
+}
+
+check_existing_hash() {
+  local hash="$1" response='' http_code='' body=''
+  response="$(curl -sS --retry 6 --retry-delay 2 --retry-all-errors -m 30 \
+    -w $'\n%{http_code}' \
+    "${AUTH[@]}" -H 'Content-Type: application/json' \
+    --data-binary "{\"hashes\":[\"$hash\"]}" \
+    "$CHECK_API" 2>&1)" || return 1
+  http_code="$(printf '%s' "$response" | tail -n 1)"
+  body="$(printf '%s' "$response" | sed '$d')"
+  if [[ "$http_code" != "200" ]]; then
+    log "check-hashes HTTP $http_code for $(printf '%s' "$hash" | cut -c1-12)"
+    return 1
+  fi
+  printf '%s' "$body" | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true
 }
 
 # Сколько zip-архивов осталось (рекурсивно, включая подпапки).
@@ -129,9 +146,13 @@ process_archive() {
     is_media "$file" || continue
     hash="$(sha256sum "$file" | cut -d' ' -f1)"
     # Дедуп против БД
-    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
-      --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
-      | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
+    if ! existing="$(check_existing_hash "$hash")"; then
+      failed=$((failed + 1))
+      log "check-hashes failed (temporary dashboard error): $(basename "$file")"
+      update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
+      continue
+    fi
     if [[ -n "$existing" ]]; then
       skipped=$((skipped + 1))
       report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
