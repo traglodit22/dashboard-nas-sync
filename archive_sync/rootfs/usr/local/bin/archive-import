@@ -163,6 +163,15 @@ is_media() {
   esac
 }
 
+is_video() {
+  local f
+  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$f" in
+    *.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 build_csv_metadata() {
   local source_root="$1" output="$2"
   # Apple/Photos exports differ in column names. Keep only rows that have a
@@ -458,10 +467,15 @@ process_loose_import() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
-    hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
-      failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
-    }
-    hash="$HASH_VALUE"
+    hash=""
+    if ! is_video "$file"; then
+      hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+      }
+      hash="$HASH_VALUE"
+    else
+      report running "loose files" $((done + skipped + failed)) "$total" 0 "uploading $(basename "$file")"
+    fi
     existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
@@ -488,7 +502,7 @@ process_loose_import() {
     file_base="$(basename "$file")"
     local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
     [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
-    form_args+=(-F "contentHash=$hash")
+    [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
     if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
       photos_meta="$(photos_metadata_for "$file")"
       form_args+=(-F "photosMeta=$photos_meta")
@@ -555,10 +569,15 @@ process_archive() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
-    hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
-      failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
-    }
-    hash="$HASH_VALUE"
+    hash=""
+    if ! is_video "$file"; then
+      hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+      }
+      hash="$HASH_VALUE"
+    else
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "uploading $(basename "$file")"
+    fi
     # Дедуп против БД
     existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
@@ -590,7 +609,7 @@ process_archive() {
     [[ -n "$captured" ]] && archive_form+=(-F "capturedAt=$captured")
     photos_meta="$(photos_metadata_for "$file")"
     [[ -n "$photos_meta" ]] && archive_form+=(-F "photosMeta=$photos_meta")
-    archive_form+=(-F "contentHash=$hash")
+    [[ -n "$hash" ]] && archive_form+=(-F "contentHash=$hash")
     UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"; UPLOAD_ARGS=("${archive_form[@]}")
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
