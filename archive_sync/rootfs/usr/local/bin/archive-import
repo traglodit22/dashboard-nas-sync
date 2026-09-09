@@ -9,6 +9,7 @@ set -euo pipefail
 : "${IMPORT_ROOT:=/share/NAS/apple-import}"
 : "${IMPORT_PARALLEL:=2}"
 : "${IMPORT_STATE_FILE:=/data/import-state.json}"
+META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
 CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
@@ -247,9 +248,29 @@ PY
 }
 
 metadata_backfill() {
-  local list="$IMPORT_ROOT/.tmp-csv-meta.tsv" file captured hash meta response matched=0 updated=0
+  local list="$IMPORT_ROOT/.tmp-csv-meta.tsv" file captured hash meta response
+  local matched=0 updated=0 failed=0 signature previous csv_count
+  csv_count="$(find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -print 2>/dev/null | wc -l)"
+  if [[ "$csv_count" -eq 0 ]]; then
+    log "no CSV metadata in $IMPORT_ROOT/.done"
+    return 0
+  fi
+  signature="$({
+    find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -printf 'csv\t%p\t%s\t%T@\n' 2>/dev/null
+    find "$IMPORT_ROOT/.done" -type f \( \
+      -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
+      -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
+      -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
+    \) -printf 'media\t%p\t%s\t%T@\n' 2>/dev/null
+  } | sort | sha256sum | cut -d' ' -f1)"
+  if [[ -f "$META_STATE_FILE" ]]; then
+    IFS= read -r previous < "$META_STATE_FILE" || true
+    if [[ "$previous" == "$signature" ]]; then
+      return 0
+    fi
+  fi
   build_csv_metadata "$IMPORT_ROOT/.done" "$list"
-  [[ -s "$list" ]] || { rm -f "$list"; log "no CSV metadata in $IMPORT_ROOT/.done"; return 0; }
+  [[ -s "$list" ]] || { rm -f "$list"; log "CSV metadata has no usable rows"; return 0; }
 
   while IFS=$'\t' read -r file captured favorite keywords people; do
     local media
@@ -276,12 +297,22 @@ print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
 PY
     )"
     response="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$meta" "$META_API" 2>/dev/null || true)"
+    if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e . >/dev/null 2>&1; then
+      failed=$((failed + 1))
+      continue
+    fi
     if [[ "$(printf '%s' "$response" | jq -r '.matched // false' 2>/dev/null)" == "true" ]]; then
       matched=$((matched + 1))
       [[ "$(printf '%s' "$response" | jq -r '.updated // false' 2>/dev/null)" == "true" ]] && updated=$((updated + 1))
     fi
   done < "$list"
   rm -f "$list"
+  if [[ "$failed" -gt 0 ]]; then
+    log "metadata backfill: matched=$matched updated=$updated failed=$failed"
+    return 1
+  fi
+  mkdir -p "$(dirname "$META_STATE_FILE")"
+  printf '%s\n' "$signature" > "$META_STATE_FILE"
   log "metadata backfill: matched=$matched updated=$updated"
 }
 
