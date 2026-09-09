@@ -35,15 +35,6 @@ while true; do
   fi
   export NAS_SYNC_TOKEN="$(read_token)"
 
-  # Новые архивы важнее фонового metadata backfill.
-  if ! find "$IMPORT_ROOT" -type f -iname '*.zip' \
-    ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print -quit 2>/dev/null | grep -q .; then
-    echo "[import] metadata backfill started"
-    if ! /usr/local/bin/archive-import --metadata-backfill; then
-      echo "[import] metadata backfill failed; retrying later"
-    fi
-  fi
-
   # Обрабатывает один архив за вызов; если архивов нет — выход 0.
   echo "[import] media scan started"
   if /usr/local/bin/archive-import; then

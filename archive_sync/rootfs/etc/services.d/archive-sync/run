@@ -7,6 +7,7 @@ token_file="$(jq -r '.token_file' "$options")"
 worker_id="$(jq -r '.worker_id' "$options")"
 batch_size="$(jq -r '.batch_size' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
+backup_poll_seconds=900
 backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
 backup_destination_root="$(jq -r '.backup_destination_root // "/share/NAS/backups"' "$options")"
 backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
@@ -30,7 +31,6 @@ sync_project_backups() {
     [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ && -n "$project_url" && -n "$project_token_file" && -n "$project_worker_id" ]] || continue
     project_token="$(tr -d '\r\n' < "$project_token_file" 2>/dev/null || true)"
     [[ -n "$project_token" ]] || continue
-    echo "Syncing backup project $slug"
     DASHBOARD_URL="$project_url" NAS_SYNC_TOKEN="$project_token" NAS_SYNC_AGENT_ID="$project_worker_id" \
       NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
       NAS_BACKUP_PROJECT_NAME="$slug" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync
@@ -49,5 +49,5 @@ while true; do
       NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
       NAS_BACKUP_PROJECT_NAME="$backup_project_name" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync || true
   fi
-  sleep "$retry_delay"
+  sleep "$backup_poll_seconds"
 done
