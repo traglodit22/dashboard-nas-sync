@@ -95,12 +95,31 @@ upload_with_heartbeat() {
 }
 
 scan_loose_files() {
-  local list="$1" heartbeat_pid rc
-  report running "scanning loose files" 0 0 0 "walking filesystem"
-  heartbeat "scanning loose files" 0 0 0 "walking filesystem" &
+  local list="$1"
+  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 > "$list"
+}
+
+PREPARED_LOOSE_TOTAL=0
+
+prepare_loose_queue() {
+  local list="$1" metadata="$2" heartbeat_pid rc=0 file
+  report running "scanning loose files" 0 0 0 "preparing queue"
+  heartbeat "scanning loose files" 0 0 0 "preparing queue" &
   heartbeat_pid=$!
-  if find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
-    ! -name '*.csv' -print0 > "$list"; then rc=0; else rc=$?; fi
+  scan_loose_files "$list" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    prioritize_media_list "$list" || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    build_csv_metadata "$IMPORT_ROOT" "$metadata" || rc=$?
+  fi
+  PREPARED_LOOSE_TOTAL=0
+  if [[ "$rc" -eq 0 ]]; then
+    while IFS= read -r -d '' file; do
+      is_media "$file" && PREPARED_LOOSE_TOTAL=$((PREPARED_LOOSE_TOTAL + 1))
+    done < "$list"
+  fi
   kill "$heartbeat_pid" 2>/dev/null || true
   wait "$heartbeat_pid" 2>/dev/null || true
   return "$rc"
@@ -464,18 +483,12 @@ process_loose_import() {
   mkdir -p "$IMPORT_ROOT/.done"
   report running "scanning loose files" 0 0 0
   CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
-  scan_loose_files "$list" || {
-    log "filesystem scan failed"
-    report error "filesystem scan failed" 0 0 0
+  prepare_loose_queue "$list" "$CSV_META_FILE" || {
+    log "loose queue preparation failed"
+    report error "loose queue preparation failed" 0 0 0
     return 1
   }
-  prioritize_media_list "$list"
-  if find "$IMPORT_ROOT" -maxdepth 2 -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
-    build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
-  else
-    rm -f "$CSV_META_FILE"
-  fi
-  while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
+  total="$PREPARED_LOOSE_TOTAL"
   [[ "$total" -gt 0 ]] || {
     rm -f "$list" "$CSV_META_FILE"
     log "no loose media in $IMPORT_ROOT"
