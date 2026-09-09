@@ -32,9 +32,75 @@ report() {
   local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
   local label="$archive"
   [[ -n "$file" ]] && label="$label :: $file"
-  curl -sf "${AUTH[@]}" \
+  curl -sf --connect-timeout 5 --max-time 10 "${AUTH[@]}" \
     "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
+}
+
+HASH_VALUE=""
+
+heartbeat() {
+  local label="$1" done="$2" total="$3" pending="$4" stage="$5"
+  while sleep 30; do
+    report running "$label" "$done" "$total" "$pending" "$stage"
+  done
+}
+
+hash_with_heartbeat() {
+  local file="$1" label="$2" done="$3" total="$4" pending="$5"
+  local result_file heartbeat_pid rc
+  result_file="$(mktemp "$IMPORT_ROOT/.hash-result.XXXXXX")"
+  report running "$label" "$done" "$total" "$pending" "hashing $(basename "$file")"
+  heartbeat "$label" "$done" "$total" "$pending" "hashing $(basename "$file")" &
+  heartbeat_pid=$!
+  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then rc=0; else rc=$?; fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
+  rm -f "$result_file"
+  [[ "$rc" -eq 0 && "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
+}
+
+UPLOAD_HTTP_CODE="000"
+UPLOAD_DIR=""
+UPLOAD_LABEL=""
+UPLOAD_DONE=0
+UPLOAD_TOTAL=0
+UPLOAD_PENDING=0
+UPLOAD_FILE_NAME=""
+UPLOAD_ARGS=()
+
+upload_with_heartbeat() {
+  local result_file heartbeat_pid rc
+  result_file="$(mktemp "$IMPORT_ROOT/.upload-status.XXXXXX")"
+  report running "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME"
+  heartbeat "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME" &
+  heartbeat_pid=$!
+  if (
+    cd "$UPLOAD_DIR" || exit 1
+    curl -sS -o /dev/null -w '%{http_code}' \
+      --retry 3 --retry-delay 2 --retry-all-errors \
+      --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
+      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$API" > "$result_file"
+  ); then rc=0; else rc=$?; fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
+  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  rm -f "$result_file"
+  return "$rc"
+}
+
+scan_loose_files() {
+  local list="$1" heartbeat_pid rc
+  report running "scanning loose files" 0 0 0 "walking filesystem"
+  heartbeat "scanning loose files" 0 0 0 "walking filesystem" &
+  heartbeat_pid=$!
+  if find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 > "$list"; then rc=0; else rc=$?; fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  return "$rc"
 }
 
 # Сколько zip-архивов осталось (рекурсивно, включая подпапки).
@@ -331,6 +397,7 @@ import json
 import sys
 
 name, content_hash, captured_at, photos_meta = sys.argv[1:]
+out = {'originalName': name, 'contentHash': content_hash}
 if captured_at:
     out['capturedAt'] = captured_at
 if photos_meta:
@@ -364,8 +431,11 @@ process_loose_import() {
   mkdir -p "$IMPORT_ROOT/.done"
   report running "scanning loose files" 0 0 0
   CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
-  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
-    ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
+  scan_loose_files "$list" || {
+    log "filesystem scan failed"
+    report error "filesystem scan failed" 0 0 0
+    return 1
+  }
   if find "$IMPORT_ROOT" -maxdepth 2 -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
     build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
   else
@@ -383,7 +453,10 @@ process_loose_import() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
-    hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
+    hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
+      failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+    }
+    hash="$HASH_VALUE"
     existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
@@ -415,12 +488,13 @@ process_loose_import() {
       photos_meta="$(photos_metadata_for "$file")"
       form_args+=(-F "photosMeta=$photos_meta")
     fi
-    http_code="$(cd "$file_dir" && curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 2 --retry-all-errors -m 180 \
-      "${AUTH[@]}" "${form_args[@]}" "$API")"
-    http_code="${http_code:-000}"
+    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0; UPLOAD_ARGS=("${form_args[@]}")
+    upload_with_heartbeat || true
+    http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
       200|201) done=$((done + 1)); move_loose_to_done "$file" ;;
-      413) failed=$((failed + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      413) skipped=$((skipped + 1)); move_loose_to_done "$file"; log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "loose files" "$done" "$skipped" "$failed"
@@ -436,7 +510,11 @@ process_loose_import() {
   prune_empty_import_dirs
   purge_done
   log "done loose files: imported=$done skipped=$skipped failed=$failed"
-  report completed "loose files" $((done + skipped + failed)) "$total" 0
+  if [[ "$failed" -gt 0 ]]; then
+    report error "loose files" $((done + skipped + failed)) "$total" 0 "failed=$failed"
+    return 1
+  fi
+  report completed "loose files" $((done + skipped)) "$total" 0
 }
 
 has_pending_loose_media() {
@@ -472,7 +550,10 @@ process_archive() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
-    hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
+    hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
+      failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+    }
+    hash="$HASH_VALUE"
     # Дедуп против БД
     existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
@@ -505,17 +586,13 @@ process_archive() {
     photos_meta="$(photos_metadata_for "$file")"
     [[ -n "$photos_meta" ]] && archive_form+=(-F "photosMeta=$photos_meta")
     archive_form+=(-F "contentHash=$hash")
-    http_code="$(cd "$file_dir" && curl -sS -o /dev/null -w '%{http_code}' \
-      --retry 3 --retry-delay 2 --retry-all-errors \
-      -m 180 \
-      "${AUTH[@]}" \
-      "${archive_form[@]}" \
-      "$API")"
-    http_code="${http_code:-000}"
+    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"; UPLOAD_ARGS=("${archive_form[@]}")
+    upload_with_heartbeat || true
+    http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
       200|201) done=$((done + 1)) ;;
-      000) failed=$((failed + 1)); log "upload failed (network): $file_base" ;;
-      413) failed=$((failed + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      413) skipped=$((skipped + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
@@ -536,7 +613,11 @@ process_archive() {
   fi
   log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
   update_state "$rel_path" "$done" "$skipped" "$failed"
-  report completed "$rel_path" "$total" "$total" "$pending"
+  if [[ "$failed" -gt 0 ]]; then
+    report error "$rel_path" $((done + skipped + failed)) "$total" "$pending" "failed=$failed"
+    return 1
+  fi
+  report completed "$rel_path" $((done + skipped)) "$total" "$pending"
   purge_done
 }
 
