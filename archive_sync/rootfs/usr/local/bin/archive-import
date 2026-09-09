@@ -13,6 +13,7 @@ set -euo pipefail
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
+STREAM_API="${DASHBOARD_URL%/}/api/sync/nas/import/stream"
 CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
 META_API="${DASHBOARD_URL%/}/api/sync/nas/import/metadata"
 STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
@@ -70,6 +71,7 @@ UPLOAD_TOTAL=0
 UPLOAD_PENDING=0
 UPLOAD_FILE_NAME=""
 UPLOAD_ARGS=()
+UPLOAD_ENDPOINT="$API"
 
 upload_with_heartbeat() {
   local result_file heartbeat_pid rc
@@ -82,7 +84,7 @@ upload_with_heartbeat() {
     curl -sS -o /dev/null -w '%{http_code}' \
       --retry 3 --retry-delay 2 --retry-all-errors \
       --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
-      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$API" > "$result_file"
+      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
   ); then rc=0; else rc=$?; fi
   kill "$heartbeat_pid" 2>/dev/null || true
   wait "$heartbeat_pid" 2>/dev/null || true
@@ -507,7 +509,18 @@ process_loose_import() {
       photos_meta="$(photos_metadata_for "$file")"
       form_args+=(-F "photosMeta=$photos_meta")
     fi
-    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0; UPLOAD_ARGS=("${form_args[@]}")
+    if is_video "$file"; then
+      local stream_type="video/mp4"
+      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+      UPLOAD_ENDPOINT="$STREAM_API"
+    else
+      UPLOAD_ARGS=("${form_args[@]}")
+      UPLOAD_ENDPOINT="$API"
+    fi
+    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
@@ -610,7 +623,18 @@ process_archive() {
     photos_meta="$(photos_metadata_for "$file")"
     [[ -n "$photos_meta" ]] && archive_form+=(-F "photosMeta=$photos_meta")
     [[ -n "$hash" ]] && archive_form+=(-F "contentHash=$hash")
-    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"; UPLOAD_ARGS=("${archive_form[@]}")
+    if is_video "$file"; then
+      local stream_type="video/mp4"
+      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+      UPLOAD_ENDPOINT="$STREAM_API"
+    else
+      UPLOAD_ARGS=("${archive_form[@]}")
+      UPLOAD_ENDPOINT="$API"
+    fi
+    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
