@@ -7,6 +7,7 @@ token_file="$(jq -r '.token_file' "$options")"
 import_enabled="$(jq -r '.import_enabled // false' "$options")"
 import_root="$(jq -r '.import_root // "/share/NAS/apple-import"' "$options")"
 import_parallel="$(jq -r '.import_parallel // 2' "$options")"
+done_retention_days="$(jq -r '.import_done_retention_days // 30' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 
 if [[ "$import_enabled" != "true" ]]; then
@@ -19,6 +20,7 @@ echo "[import] service started: root=$import_root retry=${retry_delay}s"
 export DASHBOARD_URL="$service_url"
 export IMPORT_ROOT="$import_root"
 export IMPORT_PARALLEL="$import_parallel"
+export IMPORT_DONE_RETENTION_DAYS="$done_retention_days"
 export IMPORT_STATE_FILE="/data/import-state.json"
 
 read_token() {

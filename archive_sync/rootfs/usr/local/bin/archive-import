@@ -9,6 +9,7 @@ set -euo pipefail
 : "${IMPORT_ROOT:=/share/NAS/apple-import}"
 : "${IMPORT_PARALLEL:=2}"
 : "${IMPORT_STATE_FILE:=/data/import-state.json}"
+: "${IMPORT_DONE_RETENTION_DAYS:=30}"
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
@@ -157,7 +158,7 @@ is_media() {
   local f
   f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
   case "$f" in
-    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.tif|*.mov|*.mp4|*.m4v) return 0 ;;
+    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.tif|*.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -330,6 +331,7 @@ metadata_backfill() {
       -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
       -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
       -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
+      -o -iname '*.3gp' \
     \) -printf 'media\t%p\t%s\t%T@\n' 2>/dev/null
   } | sort | sha256sum | cut -d' ' -f1)"
   if [[ -f "$META_STATE_FILE" ]]; then
@@ -387,7 +389,10 @@ PY
 }
 
 purge_done() {
-  find "$IMPORT_ROOT/.done" -mindepth 1 -delete 2>/dev/null || true
+  local days="${IMPORT_DONE_RETENTION_DAYS:-30}"
+  [[ "$days" =~ ^[0-9]+$ ]] || days=30
+  find "$IMPORT_ROOT/.done" -type f -mtime "+$days" -delete 2>/dev/null || true
+  find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
 }
 
 send_metadata_for() {
