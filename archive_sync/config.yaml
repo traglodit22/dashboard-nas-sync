@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.10.14"
+version: "0.10.15"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -48,7 +48,6 @@ options:
   import_enabled: false
   import_root: /share/NAS/apple-import
   import_parallel: 2
-  import_done_retention_days: 30
 schema:
   service_url: str
   token_file: str
@@ -78,4 +77,3 @@ schema:
   import_enabled: bool
   import_root: str
   import_parallel: int(1,8)
-  import_done_retention_days: int(0,3650)

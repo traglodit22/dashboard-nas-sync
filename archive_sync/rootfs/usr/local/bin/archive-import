@@ -9,7 +9,6 @@ set -euo pipefail
 : "${IMPORT_ROOT:=/share/NAS/apple-import}"
 : "${IMPORT_PARALLEL:=2}"
 : "${IMPORT_STATE_FILE:=/data/import-state.json}"
-: "${IMPORT_DONE_RETENTION_DAYS:=30}"
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
@@ -256,6 +255,7 @@ metadata_backfill() {
   csv_count="$(find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -print 2>/dev/null | wc -l)"
   if [[ "$csv_count" -eq 0 ]]; then
     log "no CSV metadata in $IMPORT_ROOT/.done"
+    purge_done
     return 0
   fi
   signature="$({
@@ -317,6 +317,28 @@ PY
   mkdir -p "$(dirname "$META_STATE_FILE")"
   printf '%s\n' "$signature" > "$META_STATE_FILE"
   log "metadata backfill: matched=$matched updated=$updated"
+  purge_done
+}
+
+purge_done() {
+  find "$IMPORT_ROOT/.done" -mindepth 1 -delete 2>/dev/null || true
+}
+
+send_metadata_for() {
+  local file="$1" hash="$2" captured="$3" photos_meta="$4" payload
+  payload="$(python3 - "$file" "$hash" "$captured" "$photos_meta" <<'PY'
+import json
+import sys
+
+name, content_hash, captured_at, photos_meta = sys.argv[1:]
+if captured_at:
+    out['capturedAt'] = captured_at
+if photos_meta:
+    out.update(json.loads(photos_meta))
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+  )"
+  curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$payload" "$META_API" >/dev/null 2>&1 || true
 }
 
 move_loose_to_done() {
@@ -334,13 +356,6 @@ prune_empty_import_dirs() {
     ! -path "$IMPORT_ROOT/.done/*" \
     ! -path "$IMPORT_ROOT/.tmp.*" \
     -empty -delete 2>/dev/null || true
-}
-
-prune_done() {
-  local days="${IMPORT_DONE_RETENTION_DAYS:-30}"
-  [[ "$days" =~ ^[0-9]+$ ]] || days=30
-  find "$IMPORT_ROOT/.done" -type f -mtime "+$days" -delete 2>/dev/null || true
-  find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
 }
 
 process_loose_import() {
@@ -366,6 +381,14 @@ process_loose_import() {
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
+      local csv_meta csv_favorite csv_keywords csv_people
+      csv_meta="$(csv_metadata_for "$file")"
+      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+      captured="${captured:-$(capture_date_for "$file")}"
+      photos_meta="$(photos_metadata_for "$file")"
+      if [[ -n "$photos_meta" || -n "$captured" ]]; then
+        send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+      fi
       skipped=$((skipped + 1))
       move_loose_to_done "$file"
       report running "loose files" $((done + skipped + failed)) "$total" 0
@@ -403,6 +426,7 @@ process_loose_import() {
     )
   fi
   prune_empty_import_dirs
+  purge_done
   log "done loose files: imported=$done skipped=$skipped failed=$failed"
   report completed "loose files" $((done + skipped + failed)) "$total" 0
 }
@@ -446,6 +470,14 @@ process_archive() {
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
+      local csv_meta csv_favorite csv_keywords csv_people
+      csv_meta="$(csv_metadata_for "$file")"
+      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+      captured="${captured:-$(capture_date_for "$file")}"
+      photos_meta="$(photos_metadata_for "$file")"
+      if [[ -n "$photos_meta" || -n "$captured" ]]; then
+        send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+      fi
       skipped=$((skipped + 1))
       report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
       continue
@@ -490,14 +522,16 @@ process_archive() {
   done_path="$IMPORT_ROOT/.done/$rel_path"
   done_dir="$(dirname "$done_path")"
   mkdir -p "$done_dir"
-  mv -f -- "$archive" "$done_path"
+  if [[ "$failed" -eq 0 ]]; then
+    mv -f -- "$archive" "$done_path"
+  fi
   log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
   update_state "$rel_path" "$done" "$skipped" "$failed"
   report completed "$rel_path" "$total" "$total" "$pending"
+  purge_done
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
-prune_done
 if [[ "${1:-}" == "--metadata-backfill" ]]; then
   metadata_backfill
   exit 0
