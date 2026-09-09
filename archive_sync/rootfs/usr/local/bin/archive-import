@@ -12,6 +12,7 @@ set -euo pipefail
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
 CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
+META_API="${DASHBOARD_URL%/}/api/sync/nas/import/metadata"
 STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
 AUTH=(-H "Authorization: Bearer $NAS_SYNC_TOKEN" -H "X-NAS-Agent-Id: archive-import")
 
@@ -26,31 +27,11 @@ update_state() {
 
 # Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
 # archives_left — сколько zip ещё ждёт в папке (без текущего).
-# file — текущий обрабатываемый файл (для отображения в виджете).
 report() {
-  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
-  local label="$archive"
-  if [[ -n "$file" ]]; then label="${label} :: ${file}"; fi
-  curl -sS --retry 5 --retry-delay 2 --retry-all-errors -m 20 \
-    "${AUTH[@]}" \
-    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
+  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}"
+  curl -sf "${AUTH[@]}" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
-}
-
-check_existing_hash() {
-  local hash="$1" response='' http_code='' body=''
-  response="$(curl -sS --retry 6 --retry-delay 2 --retry-all-errors -m 30 \
-    -w $'\n%{http_code}' \
-    "${AUTH[@]}" -H 'Content-Type: application/json' \
-    --data-binary "{\"hashes\":[\"$hash\"]}" \
-    "$CHECK_API" 2>&1)" || return 1
-  http_code="$(printf '%s' "$response" | tail -n 1)"
-  body="$(printf '%s' "$response" | sed '$d')"
-  if [[ "$http_code" != "200" ]]; then
-    log "check-hashes HTTP $http_code for $(printf '%s' "$hash" | cut -c1-12)"
-    return 1
-  fi
-  printf '%s' "$body" | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true
 }
 
 # Сколько zip-архивов осталось (рекурсивно, включая подпапки).
@@ -58,17 +39,20 @@ count_pending_archives() {
   find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
 }
 
-pending_archives_from_list() {
-  local current_archive="$1" count=0 item
-  for item in "${ARCHIVES[@]}"; do
-    [[ "$item" == "$current_archive" ]] || count=$((count + 1))
-  done
-  printf '%s' "$count"
-}
-
 # Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
 capture_date_for() {
   local file="$1" base dt
+  # Photo Details*.csv is the most reliable source for exported videos, which
+  # usually have no readable EXIF metadata.
+  if [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]]; then
+    local csv_name csv_date
+    while IFS=$'\t' read -r csv_name csv_date _; do
+      if [[ "$csv_name" == "$(basename "$file")" ]]; then
+        printf '%s' "$csv_date"
+        return 0
+      fi
+    done < "$CSV_META_FILE"
+  fi
   # EXIF (exiftool): DateTimeOriginal / CreateDate
   dt="$(timeout -k 5 30 exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
   if [[ -n "$dt" ]]; then printf '%s' "$dt"; return 0; fi
@@ -104,9 +88,289 @@ is_media() {
   local f
   f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
   case "$f" in
-    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
+    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.tif|*.mov|*.mp4|*.m4v) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+build_csv_metadata() {
+  local source_root="$1" output="$2"
+  # Apple/Photos exports differ in column names. Keep only rows that have a
+  # filename and a machine-readable capture date; other CSV columns remain
+  # available in .done for manual inspection.
+  python3 - "$source_root" "$output" <<'PY'
+import csv
+import datetime as dt
+import os
+import re
+import sys
+
+root, output = sys.argv[1:]
+name_words = ('filename', 'file name', 'original filename', 'original name', 'media name')
+date_words = ('date', 'capture date', 'date taken', 'creation date', 'created date', 'time')
+favorite_words = ('favorite', 'is favorite', 'favourite')
+keyword_words = ('keywords', 'keyword', 'tags', 'tag')
+people_words = ('people', 'person', 'faces', 'face names')
+
+def normalize(value):
+    return re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
+
+def parse_date(value):
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        try:
+            return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    value = re.sub(r'\s*(UTC|GMT|Z)$', '+00:00', value, flags=re.I)
+    for candidate in (value, value.replace('/', '-')):
+        try:
+            parsed = dt.datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.isoformat()
+        except ValueError:
+            pass
+    for fmt in (
+        '%Y:%m:%d %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d',
+        '%m/%d/%Y %H:%M:%S',
+        '%B %d, %Y, %H:%M:%S',
+        '%b %d, %Y, %H:%M:%S',
+    ):
+        try:
+            return dt.datetime.strptime(value, fmt).replace(tzinfo=dt.timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return None
+
+rows = {}
+for current, dirs, files in os.walk(root):
+    dirs[:] = [d for d in dirs if d not in ('.done',) and not d.startswith('.tmp.')]
+    for filename in files:
+        if not filename.lower().endswith('.csv'):
+            continue
+        csv_path = os.path.join(current, filename)
+        try:
+            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    continue
+                fields = [(field, normalize(field)) for field in reader.fieldnames if field]
+                name_field = next((field for field, key in fields if any(word in key for word in name_words)), None)
+                date_field = next(
+                    (
+                        field
+                        for field, key in fields
+                        if key in ('date taken', 'photo taken', 'capture date', 'creation date', 'created date', 'date')
+                    ),
+                    None,
+                )
+                date_field = date_field or next(
+                    (field for field, key in fields if any(word in key for word in ('captured', 'taken', 'created', 'creation'))),
+                    None,
+                )
+                date_field = date_field or next(
+                    (field for field, key in fields if key in ('time', 'capture time')), None
+                )
+                time_field = next((field for field, key in fields if key in ('time', 'capture time')), None)
+                favorite_field = next(
+                    (field for field, key in fields if any(word in key for word in favorite_words)), None
+                )
+                keyword_field = next(
+                    (field for field, key in fields if any(word in key for word in keyword_words)), None
+                )
+                people_field = next(
+                    (field for field, key in fields if any(word in key for word in people_words)), None
+                )
+                if not name_field or not date_field:
+                    continue
+                for row in reader:
+                    name = os.path.basename((row.get(name_field) or '').strip())
+                    date_value = (row.get(date_field) or '').strip()
+                    time_value = (row.get(time_field) or '').strip() if time_field else ''
+                    date = parse_date(f'{date_value} {time_value}'.strip())
+                    if name and date:
+                        favorite = (row.get(favorite_field) or '').strip().lower() if favorite_field else ''
+                        if favorite in ('yes', 'true', '1', 'y', 'да'):
+                            favorite = 'true'
+                        elif favorite in ('no', 'false', '0', 'n', 'нет'):
+                            favorite = 'false'
+                        else:
+                            favorite = ''
+                        keywords = (row.get(keyword_field) or '').strip() if keyword_field else ''
+                        people = (row.get(people_field) or '').strip() if people_field else ''
+                        rows[name] = (date, favorite, keywords, people)
+        except (OSError, UnicodeError, csv.Error):
+            continue
+
+with open(output, 'w', encoding='utf-8') as handle:
+    for name, fields in sorted(rows.items()):
+        values = '\t'.join(fields)
+        handle.write(f'{name}\t{values}\n')
+PY
+}
+
+csv_metadata_for() {
+  local file="$1" csv_name csv_date csv_favorite csv_keywords csv_people
+  [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]] || return 0
+  while IFS=$'\t' read -r csv_name csv_date csv_favorite csv_keywords csv_people; do
+    if [[ "$csv_name" == "$(basename "$file")" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "$csv_date" "$csv_favorite" "$csv_keywords" "$csv_people"
+      return 0
+    fi
+  done < "$CSV_META_FILE"
+}
+
+photos_metadata_for() {
+  local file="$1" csv_meta csv_favorite csv_keywords csv_people
+  csv_meta="$(csv_metadata_for "$file")"
+  IFS=$'\t' read -r _ csv_favorite csv_keywords csv_people <<< "$csv_meta"
+  [[ -n "$csv_favorite$csv_keywords$csv_people" ]] || return 0
+  python3 - "$csv_favorite" "$csv_keywords" "$csv_people" <<'PY'
+import json
+import sys
+
+favorite, keywords, people = sys.argv[1:]
+out = {}
+if favorite in ('true', 'false'):
+    out['favorite'] = favorite == 'true'
+if keywords:
+    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
+if people:
+    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+}
+
+metadata_backfill() {
+  local list="$IMPORT_ROOT/.tmp-csv-meta.tsv" file captured hash meta response matched=0 updated=0
+  build_csv_metadata "$IMPORT_ROOT/.done" "$list"
+  [[ -s "$list" ]] || { rm -f "$list"; log "no CSV metadata in $IMPORT_ROOT/.done"; return 0; }
+
+  while IFS=$'\t' read -r file captured favorite keywords people; do
+    local media
+    media="$(find "$IMPORT_ROOT/.done" -type f -iname "$file" -print -quit 2>/dev/null || true)"
+    [[ -n "$media" ]] || continue
+    hash="$(sha256sum "$media" | cut -d' ' -f1)"
+    meta="$(python3 - "$file" "$hash" "$captured" "$favorite" "$keywords" "$people" <<'PY'
+import json
+import sys
+
+name, content_hash, captured_at, favorite, keywords, people = sys.argv[1:]
+out = {
+    'originalName': name,
+    'contentHash': content_hash,
+    'capturedAt': captured_at,
+}
+if favorite in ('true', 'false'):
+    out['favorite'] = favorite == 'true'
+if keywords:
+    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
+if people:
+    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+    )"
+    response="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$meta" "$META_API" 2>/dev/null || true)"
+    if [[ "$(printf '%s' "$response" | jq -r '.matched // false' 2>/dev/null)" == "true" ]]; then
+      matched=$((matched + 1))
+      [[ "$(printf '%s' "$response" | jq -r '.updated // false' 2>/dev/null)" == "true" ]] && updated=$((updated + 1))
+    fi
+  done < "$list"
+  rm -f "$list"
+  log "metadata backfill: matched=$matched updated=$updated"
+}
+
+move_loose_to_done() {
+  local file="$1" relative target
+  relative="${file#"$IMPORT_ROOT"/}"
+  target="$IMPORT_ROOT/.done/loose/$relative"
+  mkdir -p "$(dirname "$target")"
+  mv -f -- "$file" "$target"
+}
+
+prune_empty_import_dirs() {
+  find "$IMPORT_ROOT" -depth -type d \
+    ! -path "$IMPORT_ROOT" \
+    ! -path "$IMPORT_ROOT/.done" \
+    ! -path "$IMPORT_ROOT/.done/*" \
+    ! -path "$IMPORT_ROOT/.tmp.*" \
+    -empty -delete 2>/dev/null || true
+}
+
+process_loose_import() {
+  local list="$IMPORT_ROOT/.tmp-loose-files.list" file hash existing captured photos_meta
+  local total=0 done=0 skipped=0 failed=0
+  mkdir -p "$IMPORT_ROOT/.done"
+  CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
+  build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
+  find "$IMPORT_ROOT" -type f ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print0 > "$list" 2>/dev/null || true
+  while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
+  [[ "$total" -gt 0 ]] || {
+    rm -f "$list" "$CSV_META_FILE"
+    log "no loose media in $IMPORT_ROOT"
+    return 0
+  }
+
+  report running "loose files" 0 "$total" 0
+  while IFS= read -r -d '' file; do
+    is_media "$file" || continue
+    hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
+    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
+      --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
+      | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
+    if [[ -n "$existing" ]]; then
+      skipped=$((skipped + 1))
+      move_loose_to_done "$file"
+      report running "loose files" $((done + skipped + failed)) "$total" 0
+      continue
+    fi
+    local csv_meta csv_favorite csv_keywords csv_people
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
+    local http_code file_dir file_base
+    file_dir="$(dirname "$file")"
+    file_base="$(basename "$file")"
+    local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
+    [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
+    form_args+=(-F "contentHash=$hash")
+    if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
+      photos_meta="$(photos_metadata_for "$file")"
+      form_args+=(-F "photosMeta=$photos_meta")
+    fi
+    http_code="$(cd "$file_dir" && curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 2 --retry-all-errors -m 180 \
+      "${AUTH[@]}" "${form_args[@]}" "$API")"
+    http_code="${http_code:-000}"
+    case "$http_code" in
+      200|201) done=$((done + 1)); move_loose_to_done "$file" ;;
+      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+    esac
+    update_state "loose files" "$done" "$skipped" "$failed"
+    report running "loose files" $((done + skipped + failed)) "$total" 0
+  done < "$list"
+
+  rm -f "$list" "$CSV_META_FILE"
+  if [[ "$failed" -eq 0 ]]; then
+    while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
+      find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
+    )
+  fi
+  prune_empty_import_dirs
+  log "done loose files: imported=$done skipped=$skipped failed=$failed"
+  report completed "loose files" $((done + skipped + failed)) "$total" 0
+}
+
+has_pending_loose_media() {
+  local file
+  while IFS= read -r -d '' file; do
+    if is_media "$file"; then return 0; fi
+  done < <(find "$IMPORT_ROOT" -type f ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print0 2>/dev/null)
+  return 1
 }
 
 process_archive() {
@@ -120,82 +384,62 @@ process_archive() {
 
   # Собираем список медиафайлов
   local list="$work_dir/.files.list"
+  CSV_META_FILE="$work_dir/.csv-meta.tsv"
+  build_csv_metadata "$work_dir" "$CSV_META_FILE"
   find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
-  local all_count=0
-  while IFS= read -r -d '' _; do all_count=$((all_count + 1)); done < "$list"
-  log "unpacked $(basename "$archive"): files=$all_count"
   # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
   local total=0 f
   while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
-  log "media files in $(basename "$archive"): $total"
-  log "counting pending archives for $(basename "$archive")"
   # -1: текущий архив уже в работе, не считаем его в «осталось»
-  local pending
-  pending="$(pending_archives_from_list "$archive")"
-  log "pending archives for $(basename "$archive"): $pending"
+  local pending=$(( $(count_pending_archives) - 1 ))
   report running "$(basename "$archive")" 0 "$total" "$pending"
 
-  local file hash existing captured mime first_media=''
-  while IFS= read -r -d '' file; do
-    if is_media "$file"; then first_media="$file"; break; fi
-  done < "$list"
-  if [[ -n "$first_media" ]]; then
-    log "first media file: $(basename "$first_media")"
-  else
-    log "first media file: none"
-  fi
-  log "starting media loop for $(basename "$archive")"
+  local file hash existing captured
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
-    log "processing $(basename "$file")"
-    report running "$(basename "$archive")" "$((done + skipped + failed))" "$total" "$pending" "$(basename "$file")"
-    if ! hash="$(timeout -k 5 300 sha256sum "$file" 2>/dev/null | cut -d' ' -f1)"; then
-      failed=$((failed + 1))
-      log "sha256sum failed/timeout: $(basename "$file")"
-      update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-      continue
-    fi
+    hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
     # Дедуп против БД
-    if ! existing="$(check_existing_hash "$hash")"; then
-      failed=$((failed + 1))
-      log "check-hashes failed (temporary dashboard error): $(basename "$file")"
-      update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
-      continue
-    fi
+    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
+      --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
+      | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
       skipped=$((skipped + 1))
       report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
       continue
     fi
-    captured="$(capture_date_for "$file")"
+    local csv_meta csv_favorite csv_keywords csv_people photos_meta
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
     # Загрузка
     local http_code file_size file_dir file_base
     file_size="$(stat -c%s "$file" 2>/dev/null || printf '?')"
+    log "uploading $(basename "$file") size=${file_size} bytes"
     file_dir="$(dirname "$file")"
     file_base="$(basename "$file")"
-    log "uploading $file_base size=${file_size} bytes"
-    # cd в каталог файла: curl -F "file=@path" ломается на ',' и ';' в пути каталога.
+    local -a archive_form=(-F "file=@$file_base" -F "fileName=$file_base")
+    [[ -n "$captured" ]] && archive_form+=(-F "capturedAt=$captured")
+    photos_meta="$(photos_metadata_for "$file")"
+    [[ -n "$photos_meta" ]] && archive_form+=(-F "photosMeta=$photos_meta")
+    archive_form+=(-F "contentHash=$hash")
     http_code="$(cd "$file_dir" && curl -sS -o /dev/null -w '%{http_code}' \
       --retry 3 --retry-delay 2 --retry-all-errors \
-      -m 900 \
+      -m 180 \
       "${AUTH[@]}" \
-      -F "file=@$file_base" \
-      -F "fileName=$file_base" \
-      ${captured:+-F "capturedAt=$captured"} \
-      -F "contentHash=$hash" \
+      "${archive_form[@]}" \
       "$API")"
     http_code="${http_code:-000}"
     case "$http_code" in
       200|201) done=$((done + 1)) ;;
-      000) failed=$((failed + 1)); log "upload failed (network): $(basename "$file")" ;;
-      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $(basename "$file")" ;;
+      000) failed=$((failed + 1)); log "upload failed (network): $file_base" ;;
+      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
     report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
   done < "$list"
 
   rm -rf "$work_dir"
+  CSV_META_FILE=""
   mkdir -p "$IMPORT_ROOT/.done"
   # Сохраняем относительный путь подпапки, чтобы одинаковые имена архивов не конфликтовали.
   local rel_path done_path done_dir
@@ -210,12 +454,25 @@ process_archive() {
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
+if [[ "${1:-}" == "--metadata-backfill" ]]; then
+  metadata_backfill
+  exit 0
+fi
+process_loose_import
 # Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
-mapfile -t ARCHIVES < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
-if (( ${#ARCHIVES[@]} == 0 )); then
+mapfile -t archives < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
+if (( ${#archives[@]} == 0 )); then
+  # CSV is metadata, not a gallery item. Keep it in .done for audit/retries.
+  if ! has_pending_loose_media; then
+    while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
+      find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
+    )
+    prune_empty_import_dirs
+  fi
   log "no archives in $IMPORT_ROOT"
   exit 0
 fi
 
 # По одному архиву за проход (сервис перезапускается supervisor'ом).
-process_archive "${ARCHIVES[0]}"
+process_archive "${archives[0]}"
+prune_empty_import_dirs
