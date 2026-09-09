@@ -362,6 +362,7 @@ process_loose_import() {
   local list="$IMPORT_ROOT/.tmp-loose-files.list" file hash existing captured photos_meta
   local total=0 done=0 skipped=0 failed=0
   mkdir -p "$IMPORT_ROOT/.done"
+  report running "scanning loose files" 0 0 0
   CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
   build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
   find "$IMPORT_ROOT" -type f ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print0 > "$list" 2>/dev/null || true
@@ -369,6 +370,7 @@ process_loose_import() {
   [[ "$total" -gt 0 ]] || {
     rm -f "$list" "$CSV_META_FILE"
     log "no loose media in $IMPORT_ROOT"
+    report idle "waiting for Apple media" 0 0 0
     return 0
   }
 
@@ -548,6 +550,7 @@ if (( ${#archives[@]} == 0 )); then
     prune_empty_import_dirs
   fi
   log "no archives in $IMPORT_ROOT"
+  report idle "waiting for Apple media" 0 0 0
   exit 0
 fi
 
