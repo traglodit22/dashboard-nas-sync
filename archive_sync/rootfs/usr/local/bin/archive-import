@@ -364,8 +364,13 @@ process_loose_import() {
   mkdir -p "$IMPORT_ROOT/.done"
   report running "scanning loose files" 0 0 0
   CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
-  build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
-  find "$IMPORT_ROOT" -type f ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print0 > "$list" 2>/dev/null || true
+  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
+  if find "$IMPORT_ROOT" -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
+    build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
+  else
+    rm -f "$CSV_META_FILE"
+  fi
   while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
   [[ "$total" -gt 0 ]] || {
     rm -f "$list" "$CSV_META_FILE"
@@ -437,7 +442,7 @@ has_pending_loose_media() {
   local file
   while IFS= read -r -d '' file; do
     if is_media "$file"; then return 0; fi
-  done < <(find "$IMPORT_ROOT" -type f ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print0 2>/dev/null)
+  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f -print0 2>/dev/null)
   return 1
 }
 
