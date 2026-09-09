@@ -377,7 +377,7 @@ process_loose_import() {
     is_media "$file" || continue
     report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
     hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
-    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
+    existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
@@ -466,7 +466,7 @@ process_archive() {
     report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
     hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
     # Дедуп против БД
-    existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
+    existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
       | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     if [[ -n "$existing" ]]; then
