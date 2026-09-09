@@ -436,9 +436,12 @@ PY
 }
 
 purge_done() {
-  local days="${IMPORT_DONE_RETENTION_DAYS:-30}"
-  [[ "$days" =~ ^[0-9]+$ ]] || days=30
-  find "$IMPORT_ROOT/.done" -type f -mtime "+$days" -delete 2>/dev/null || true
+  find "$IMPORT_ROOT/.done" -type f \( \
+    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
+    -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
+    -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
+    -o -iname '*.3gp' -o -iname '*.zip' \
+  \) -delete 2>/dev/null || true
   find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
 }
 
@@ -460,12 +463,8 @@ PY
   curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$payload" "$META_API" >/dev/null 2>&1 || true
 }
 
-move_loose_to_done() {
-  local file="$1" relative target
-  relative="${file#"$IMPORT_ROOT"/}"
-  target="$IMPORT_ROOT/.done/loose/$relative"
-  mkdir -p "$(dirname "$target")"
-  mv -f -- "$file" "$target"
+remove_loose_after_success() {
+  rm -f -- "$1"
 }
 
 prune_empty_import_dirs() {
@@ -522,7 +521,7 @@ process_loose_import() {
         send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
       fi
       skipped=$((skipped + 1))
-      move_loose_to_done "$file"
+      remove_loose_after_success "$file"
       report running "loose files" $((done + skipped + failed)) "$total" 0
       continue
     fi
@@ -555,8 +554,8 @@ process_loose_import() {
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
-      200|201) done=$((done + 1)); move_loose_to_done "$file" ;;
-      413) skipped=$((skipped + 1)); move_loose_to_done "$file"; log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
+      413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
       000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
@@ -566,7 +565,12 @@ process_loose_import() {
 
   rm -f "$list" "$CSV_META_FILE"
   if [[ "$failed" -eq 0 ]]; then
-    while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
+    while IFS= read -r -d '' file; do
+      relative="${file#"$IMPORT_ROOT"/}"
+      target="$IMPORT_ROOT/.done/$relative"
+      mkdir -p "$(dirname "$target")"
+      mv -f -- "$file" "$target"
+    done < <(
       find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
     )
   fi
@@ -689,7 +693,7 @@ process_archive() {
   done_dir="$(dirname "$done_path")"
   mkdir -p "$done_dir"
   if [[ "$failed" -eq 0 ]]; then
-    mv -f -- "$archive" "$done_path"
+    rm -f -- "$archive"
   fi
   log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
   update_state "$rel_path" "$done" "$skipped" "$failed"
@@ -718,7 +722,12 @@ fi
 process_loose_import
 # CSV is metadata, not a gallery item. Keep it in .done for audit/retries.
 if ! has_pending_loose_media; then
-  while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
+  while IFS= read -r -d '' file; do
+    relative="${file#"$IMPORT_ROOT"/}"
+    target="$IMPORT_ROOT/.done/$relative"
+    mkdir -p "$(dirname "$target")"
+    mv -f -- "$file" "$target"
+  done < <(
     find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
   )
   prune_empty_import_dirs
