@@ -366,7 +366,7 @@ process_loose_import() {
   CSV_META_FILE="$IMPORT_ROOT/.tmp-csv-meta.tsv"
   find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
     ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
-  if find "$IMPORT_ROOT" -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
+  if find "$IMPORT_ROOT" -maxdepth 2 -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
     build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
   else
     rm -f "$CSV_META_FILE"
