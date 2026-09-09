@@ -420,6 +420,7 @@ process_loose_import() {
     http_code="${http_code:-000}"
     case "$http_code" in
       200|201) done=$((done + 1)); move_loose_to_done "$file" ;;
+      413) failed=$((failed + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "loose files" "$done" "$skipped" "$failed"
@@ -514,6 +515,7 @@ process_archive() {
     case "$http_code" in
       200|201) done=$((done + 1)) ;;
       000) failed=$((failed + 1)); log "upload failed (network): $file_base" ;;
+      413) failed=$((failed + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
