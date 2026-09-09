@@ -1,0 +1,53 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+options=/data/options.json
+service_url="$(jq -r '.service_url' "$options")"
+token_file="$(jq -r '.token_file' "$options")"
+worker_id="$(jq -r '.worker_id' "$options")"
+batch_size="$(jq -r '.batch_size' "$options")"
+retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
+backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
+backup_destination_root="$(jq -r '.backup_destination_root // "/share/NAS/backups"' "$options")"
+backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
+backup_projects_json="$(jq -r '.backup_projects_json // "[]"' "$options")"
+
+export DASHBOARD_URL="$service_url"
+export NAS_BACKUP_ROOT="$backup_destination_root"
+export NAS_BACKUP_PROJECT_NAME="$backup_project_name"
+
+read_token() { tr -d '\r\n' < "$token_file" 2>/dev/null || true; }
+
+sync_project_backups() {
+  local encoded project slug project_url project_token_file project_worker_id project_token
+  jq -e 'type == "array"' <<< "$backup_projects_json" >/dev/null || return 1
+  while IFS= read -r encoded; do
+    project="$(printf '%s' "$encoded" | base64 -d)"
+    slug="$(jq -r '.slug // empty' <<< "$project")"
+    project_url="$(jq -r '.service_url // empty' <<< "$project")"
+    project_token_file="$(jq -r '.token_file // empty' <<< "$project")"
+    project_worker_id="$(jq -r '.worker_id // empty' <<< "$project")"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ && -n "$project_url" && -n "$project_token_file" && -n "$project_worker_id" ]] || continue
+    project_token="$(tr -d '\r\n' < "$project_token_file" 2>/dev/null || true)"
+    [[ -n "$project_token" ]] || continue
+    echo "Syncing backup project $slug"
+    DASHBOARD_URL="$project_url" NAS_SYNC_TOKEN="$project_token" NAS_SYNC_AGENT_ID="$project_worker_id" \
+      NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
+      NAS_BACKUP_PROJECT_NAME="$slug" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync
+  done < <(jq -r '.[] | @base64' <<< "$backup_projects_json")
+}
+
+while true; do
+  if [[ ! -s "$token_file" || -z "$service_url" ]]; then
+    sleep "$retry_delay"
+    continue
+  fi
+  export NAS_SYNC_TOKEN="$(read_token)"
+  if [[ "$backup_enabled" == "true" ]]; then
+    sync_project_backups || true
+    DASHBOARD_URL="$service_url" NAS_SYNC_TOKEN="$NAS_SYNC_TOKEN" NAS_SYNC_AGENT_ID="$worker_id" \
+      NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
+      NAS_BACKUP_PROJECT_NAME="$backup_project_name" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync || true
+  fi
+  sleep "$retry_delay"
+done
