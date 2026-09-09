@@ -174,6 +174,23 @@ is_video() {
   esac
 }
 
+prioritize_media_list() {
+  local list="$1"
+  python3 - "$list" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, 'rb') as handle:
+    files = [item for item in handle.read().split(b'\0') if item]
+video = {b'.mov', b'.mp4', b'.m4v', b'.3gp'}
+files.sort(key=lambda item: (os.path.splitext(item.lower())[1] in video, item.lower()))
+with open(path, 'wb') as handle:
+    for item in files:
+        handle.write(item + b'\0')
+PY
+}
+
 build_csv_metadata() {
   local source_root="$1" output="$2"
   # Apple/Photos exports differ in column names. Keep only rows that have a
@@ -452,6 +469,7 @@ process_loose_import() {
     report error "filesystem scan failed" 0 0 0
     return 1
   }
+  prioritize_media_list "$list"
   if find "$IMPORT_ROOT" -maxdepth 2 -type f -iname '*.csv' -print -quit 2>/dev/null | grep -q .; then
     build_csv_metadata "$IMPORT_ROOT" "$CSV_META_FILE"
   else
@@ -571,6 +589,7 @@ process_archive() {
   CSV_META_FILE="$work_dir/.csv-meta.tsv"
   build_csv_metadata "$work_dir" "$CSV_META_FILE"
   find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
+  prioritize_media_list "$list"
   # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
   local total=0 f
   while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
@@ -674,22 +693,20 @@ if [[ "${1:-}" == "--metadata-backfill" ]]; then
   metadata_backfill
   exit 0
 fi
-process_loose_import
 # Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
 mapfile -t archives < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
-if (( ${#archives[@]} == 0 )); then
-  # CSV is metadata, not a gallery item. Keep it in .done for audit/retries.
-  if ! has_pending_loose_media; then
-    while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
-      find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
-    )
-    prune_empty_import_dirs
-  fi
-  log "no archives in $IMPORT_ROOT"
-  report idle "waiting for Apple media" 0 0 0
+if (( ${#archives[@]} > 0 )); then
+  # Новые архивы имеют приоритет над большой очередью уже распакованных файлов.
+  process_archive "${archives[0]}"
+  prune_empty_import_dirs
   exit 0
 fi
 
-# По одному архиву за проход (сервис перезапускается supervisor'ом).
-process_archive "${archives[0]}"
-prune_empty_import_dirs
+process_loose_import
+# CSV is metadata, not a gallery item. Keep it in .done for audit/retries.
+if ! has_pending_loose_media; then
+  while IFS= read -r -d '' file; do move_loose_to_done "$file"; done < <(
+    find "$IMPORT_ROOT" -type f -iname '*.csv' ! -path "$IMPORT_ROOT/.done/*" -print0 2>/dev/null
+  )
+  prune_empty_import_dirs
+fi

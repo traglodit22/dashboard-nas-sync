@@ -35,11 +35,13 @@ while true; do
   fi
   export NAS_SYNC_TOKEN="$(read_token)"
 
-  # Automatically enrich media already moved to .done. The worker stores a
-  # CSV fingerprint, so this is cheap on subsequent polling cycles.
-  echo "[import] metadata backfill started"
-  if ! /usr/local/bin/archive-import --metadata-backfill; then
-    echo "[import] metadata backfill failed; retrying later"
+  # Новые архивы важнее фонового metadata backfill.
+  if ! find "$IMPORT_ROOT" -type f -iname '*.zip' \
+    ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print -quit 2>/dev/null | grep -q .; then
+    echo "[import] metadata backfill started"
+    if ! /usr/local/bin/archive-import --metadata-backfill; then
+      echo "[import] metadata backfill failed; retrying later"
+    fi
   fi
 
   # Обрабатывает один архив за вызов; если архивов нет — выход 0.
@@ -47,7 +49,8 @@ while true; do
   if /usr/local/bin/archive-import; then
     echo "[import] media scan finished"
     # Если архив был обработан — сразу берём следующий; если пусто — ждём.
-    if [[ -f "$IMPORT_STATE_FILE" ]] && find "$IMPORT_ROOT" -maxdepth 1 -iname '*.zip' -print -quit 2>/dev/null | grep -q .; then
+    if [[ -f "$IMPORT_STATE_FILE" ]] && find "$IMPORT_ROOT" -type f -iname '*.zip' \
+      ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print -quit 2>/dev/null | grep -q .; then
       continue
     fi
     sleep "$retry_delay"
