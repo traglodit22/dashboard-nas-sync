@@ -14,6 +14,8 @@ if [[ "$import_enabled" != "true" ]]; then
   exit 0
 fi
 
+echo "[import] service started: root=$import_root retry=${retry_delay}s"
+
 export DASHBOARD_URL="$service_url"
 export IMPORT_ROOT="$import_root"
 export IMPORT_PARALLEL="$import_parallel"
@@ -33,19 +35,23 @@ while true; do
 
   # Automatically enrich media already moved to .done. The worker stores a
   # CSV fingerprint, so this is cheap on subsequent polling cycles.
+  echo "[import] metadata backfill started"
   if ! /usr/local/bin/archive-import --metadata-backfill; then
     echo "[import] metadata backfill failed; retrying later"
   fi
 
   # Обрабатывает один архив за вызов; если архивов нет — выход 0.
+  echo "[import] media scan started"
   if /usr/local/bin/archive-import; then
+    echo "[import] media scan finished"
     # Если архив был обработан — сразу берём следующий; если пусто — ждём.
     if [[ -f "$IMPORT_STATE_FILE" ]] && find "$IMPORT_ROOT" -maxdepth 1 -iname '*.zip' -print -quit 2>/dev/null | grep -q .; then
       continue
     fi
     sleep "$retry_delay"
   else
-    echo "[import] failed; retrying in ${retry_delay}s"
+    code=$?
+    echo "[import] media scan failed (exit=$code); retrying in ${retry_delay}s"
     sleep "$retry_delay"
   fi
 done
