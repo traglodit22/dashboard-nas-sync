@@ -9,6 +9,7 @@ set -euo pipefail
 : "${IMPORT_ROOT:=/share/NAS/apple-import}"
 : "${IMPORT_PARALLEL:=2}"
 : "${IMPORT_STATE_FILE:=/data/import-state.json}"
+: "${IMPORT_DONE_RETENTION_DAYS:=30}"
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
@@ -29,9 +30,11 @@ update_state() {
 # Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
 # archives_left — сколько zip ещё ждёт в папке (без текущего).
 report() {
-  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}"
+  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
+  local label="$archive"
+  [[ -n "$file" ]] && label="$label :: $file"
   curl -sf "${AUTH[@]}" \
-    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$archive" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
 }
 
@@ -333,6 +336,13 @@ prune_empty_import_dirs() {
     -empty -delete 2>/dev/null || true
 }
 
+prune_done() {
+  local days="${IMPORT_DONE_RETENTION_DAYS:-30}"
+  [[ "$days" =~ ^[0-9]+$ ]] || days=30
+  find "$IMPORT_ROOT/.done" -type f -mtime "+$days" -delete 2>/dev/null || true
+  find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
+}
+
 process_loose_import() {
   local list="$IMPORT_ROOT/.tmp-loose-files.list" file hash existing captured photos_meta
   local total=0 done=0 skipped=0 failed=0
@@ -350,6 +360,7 @@ process_loose_import() {
   report running "loose files" 0 "$total" 0
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
+    report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
     hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
     existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
       --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
@@ -382,7 +393,7 @@ process_loose_import() {
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "loose files" "$done" "$skipped" "$failed"
-    report running "loose files" $((done + skipped + failed)) "$total" 0
+    report running "loose files" $((done + skipped + failed)) "$total" 0 "$file_base"
   done < "$list"
 
   rm -f "$list" "$CSV_META_FILE"
@@ -428,6 +439,7 @@ process_archive() {
   local file hash existing captured
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
+    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
     hash="$(timeout -k 5 300 sha256sum "$file" | cut -d' ' -f1)"
     # Дедуп против БД
     existing="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' \
@@ -485,6 +497,7 @@ process_archive() {
 }
 
 mkdir -p "$IMPORT_ROOT/.done"
+prune_done
 if [[ "${1:-}" == "--metadata-backfill" ]]; then
   metadata_backfill
   exit 0
