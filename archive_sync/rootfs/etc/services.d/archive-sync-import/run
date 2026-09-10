@@ -35,8 +35,10 @@ scan_heartbeat() {
   while true; do
     sleep 45
     curl -sS -m 10 \
+      -H "Authorization: Bearer ${NAS_SYNC_TOKEN}" \
+      -H "X-NAS-Agent-Id: archive-import" \
       "${STATUS_API}?status=running&archive=media%20scan&done=0&total=0&archivesLeft=0" \
-      -H "Authorization: Bearer ${NAS_SYNC_TOKEN}" >/dev/null 2>&1 || true
+      >/dev/null 2>&1 || true
   done
 }
 
