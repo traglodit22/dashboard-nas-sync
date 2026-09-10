@@ -94,6 +94,35 @@ upload_with_heartbeat() {
   return "$rc"
 }
 
+# Хеш без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
+hash_value_of() {
+  local file="$1" result_file
+  result_file="$(mktemp)"
+  HASH_VALUE=""
+  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then
+    HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
+  fi
+  rm -f "$result_file"
+  [[ "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
+}
+
+# Аплоад без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
+upload_quiet() {
+  local result_file rc
+  result_file="$(mktemp)"
+  if (
+    cd "$UPLOAD_DIR" || exit 1
+    curl -sS -o /dev/null -w '%{http_code}' \
+      --retry 3 --retry-delay 2 --retry-all-errors \
+      --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
+      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
+  ); then rc=0; else rc=$?; fi
+  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
+  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  rm -f "$result_file"
+  return "$rc"
+}
+
 # Сколько zip-архивов осталось (рекурсивно, включая подпапки).
 count_pending_archives() {
   find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
@@ -465,35 +494,26 @@ find_next_loose_media() {
   return 1
 }
 
-process_loose_import() {
-  local list="$IMPORT_ROOT/.tmp-loose-files.list"
+# --- Параллельная обработка loose-файлов -------------------------------------
+# Воркер обрабатывает свою часть списка и пишет счётчики в stat-файл.
+# Статус в дашборд шлёт агрегатор (process_loose_import), чтобы прогресс
+# не прыгал между воркерами.
+process_loose_chunk() {
+  local idx="$1"
+  local chunk="$IMPORT_ROOT/.tmp-loose-chunk-$idx.list"
+  local stat="$IMPORT_ROOT/.tmp-loose-stat-$idx"
   local file hash existing captured photos_meta
-  local done=0 skipped=0 failed=0 total=0
-  mkdir -p "$IMPORT_ROOT/.done"
-  CSV_META_FILE=""
-
-  # Список собираем ОДИН раз за вызов: полный find на медленном NAS дорогой,
-  # а прошлая схема делала обход на каждый файл — импорт почти стоял.
-  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
-    ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
-  prioritize_media_list "$list"
-  while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
-
-  if [[ "$total" -eq 0 ]]; then
-    rm -f "$list"
-    log "no loose media in $IMPORT_ROOT"
-    report idle "waiting for Apple media" 0 0 0
-    return 0
-  fi
-
-  report running "loose files" 0 "$total" 0
+  local done=0 skipped=0 failed=0
+  local csv_meta csv_favorite csv_keywords csv_people http_code file_dir file_base
+  printf '0 0 0\n' > "$stat"
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
-    report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
     hash=""
+    captured=""
+    photos_meta=""
     if ! is_video "$file"; then
-      hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+      hash_value_of "$file" || {
+        failed=$((failed + 1)); printf '%s %s %s\n' "$done" "$skipped" "$failed" > "$stat"; continue
       }
       hash="$HASH_VALUE"
     fi
@@ -504,7 +524,6 @@ process_loose_import() {
         | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
     fi
     if [[ -n "$existing" ]]; then
-      local csv_meta csv_favorite csv_keywords csv_people
       csv_meta="$(csv_metadata_for "$file")"
       IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
       captured="${captured:-$(capture_date_for "$file")}"
@@ -514,47 +533,121 @@ process_loose_import() {
       fi
       skipped=$((skipped + 1))
       remove_loose_after_success "$file"
-    else
-      local csv_meta csv_favorite csv_keywords csv_people
-      csv_meta="$(csv_metadata_for "$file")"
-      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-      captured="${captured:-$(capture_date_for "$file")}"
-      local http_code file_dir file_base
-      file_dir="$(dirname "$file")"
-      file_base="$(basename "$file")"
-      local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
-      [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
-      [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
-      if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
-        photos_meta="$(photos_metadata_for "$file")"
-        form_args+=(-F "photosMeta=$photos_meta")
-      fi
-      if is_video "$file"; then
-        local stream_type="video/mp4"
-        [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
-        UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
-        [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
-        [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
-        UPLOAD_ENDPOINT="$STREAM_API"
-      else
-        UPLOAD_ARGS=("${form_args[@]}")
-        UPLOAD_ENDPOINT="$API"
-      fi
-      UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
-      upload_with_heartbeat || true
-      http_code="$UPLOAD_HTTP_CODE"
-      case "$http_code" in
-        200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
-        413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
-        000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
-        *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
-      esac
+      printf '%s %s %s\n' "$done" "$skipped" "$failed" > "$stat"
+      continue
     fi
-    update_state "loose files" "$done" "$skipped" "$failed"
-    report running "loose files" $((done + skipped + failed)) "$total" 0
-  done < "$list"
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
+    file_dir="$(dirname "$file")"
+    file_base="$(basename "$file")"
+    local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
+    [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
+    [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
+    if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
+      photos_meta="$(photos_metadata_for "$file")"
+      form_args+=(-F "photosMeta=$photos_meta")
+    fi
+    if is_video "$file"; then
+      local stream_type="video/mp4"
+      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+      UPLOAD_ENDPOINT="$STREAM_API"
+    else
+      UPLOAD_ARGS=("${form_args[@]}")
+      UPLOAD_ENDPOINT="$API"
+    fi
+    UPLOAD_DIR="$file_dir"
+    upload_quiet || true
+    http_code="$UPLOAD_HTTP_CODE"
+    case "$http_code" in
+      200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
+      413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
+      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+    esac
+    printf '%s %s %s\n' "$done" "$skipped" "$failed" > "$stat"
+  done < "$chunk"
+  rm -f "$chunk"
+}
 
-  rm -f "$list"
+process_loose_import() {
+  local list="$IMPORT_ROOT/.tmp-loose-files.list"
+  local file hash existing captured photos_meta
+  local done=0 skipped=0 failed=0 total=0
+  mkdir -p "$IMPORT_ROOT/.done"
+  CSV_META_FILE=""
+
+  # Скан может идти минуты на медленном NAS — держим статус живым.
+  ( while sleep 45; do report running "media scan" 0 0 0; done ) &
+  local scan_hb=$!
+  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
+  prioritize_media_list "$list"
+  while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
+  kill "$scan_hb" 2>/dev/null || true
+  wait "$scan_hb" 2>/dev/null || true
+
+  if [[ "$total" -eq 0 ]]; then
+    rm -f "$list"
+    log "no loose media in $IMPORT_ROOT"
+    report idle "waiting for Apple media" 0 0 0
+    return 0
+  fi
+
+  local workers="${IMPORT_PARALLEL:-3}"
+  [[ "$workers" =~ ^[0-9]+$ ]] || workers=3
+  if (( workers < 1 )); then workers=1; fi
+  if (( workers > 8 )); then workers=8; fi
+
+  # Разбиваем список по кругу на $workers частей.
+  python3 - "$list" "$workers" "$IMPORT_ROOT" <<'PY'
+import os, sys
+list_path, workers, root = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+data = [x for x in open(list_path, 'rb').read().split(b'\0') if x]
+handles = [open(os.path.join(root, '.tmp-loose-chunk-%d.list' % i), 'wb') for i in range(workers)]
+try:
+    for i, item in enumerate(data):
+        handles[i % workers].write(item + b'\0')
+finally:
+    for h in handles:
+        h.close()
+PY
+
+  log "loose files: total=$total workers=$workers"
+  local pids=() i
+  for ((i = 0; i < workers; i++)); do
+    printf '0 0 0\n' > "$IMPORT_ROOT/.tmp-loose-stat-$i"
+    process_loose_chunk "$i" &
+    pids+=("$!")
+  done
+
+  local alive=1 a b c p D S F
+  while [[ "$alive" -eq 1 ]]; do
+    alive=0
+    for p in "${pids[@]}"; do
+      kill -0 "$p" 2>/dev/null && alive=1
+    done
+    D=0; S=0; F=0
+    for ((i = 0; i < workers; i++)); do
+      if read -r a b c < "$IMPORT_ROOT/.tmp-loose-stat-$i" 2>/dev/null; then
+        D=$((D + ${a:-0})); S=$((S + ${b:-0})); F=$((F + ${c:-0}))
+      fi
+    done
+    report running "loose files" $((D + S + F)) "$total" 0
+    [[ "$alive" -eq 1 ]] && sleep 8
+  done
+  for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+
+  done=0; skipped=0; failed=0
+  for ((i = 0; i < workers; i++)); do
+    if read -r a b c < "$IMPORT_ROOT/.tmp-loose-stat-$i" 2>/dev/null; then
+      done=$((done + ${a:-0})); skipped=$((skipped + ${b:-0})); failed=$((failed + ${c:-0}))
+    fi
+  done
+  rm -f "$list" "$IMPORT_ROOT"/.tmp-loose-chunk-*.list "$IMPORT_ROOT"/.tmp-loose-stat-*
   prune_empty_import_dirs
   log "done loose files: imported=$done skipped=$skipped failed=$failed"
   if [[ "$failed" -gt 0 ]]; then

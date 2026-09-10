@@ -27,21 +27,6 @@ read_token() {
   tr -d '\r\n' < "$token_file" 2>/dev/null || true
 }
 
-STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
-
-# Скан может идти минуты на медленном NAS, а дашборд считает «нет связи»
-# после 2 минут тишины — фон-цикл держит статус живым во время скана.
-scan_heartbeat() {
-  while true; do
-    sleep 45
-    curl -sS -m 10 \
-      -H "Authorization: Bearer ${NAS_SYNC_TOKEN}" \
-      -H "X-NAS-Agent-Id: archive-import" \
-      "${STATUS_API}?status=running&archive=media%20scan&done=0&total=0&archivesLeft=0" \
-      >/dev/null 2>&1 || true
-  done
-}
-
 while true; do
   if [[ ! -s "$token_file" || -z "$service_url" ]]; then
     echo "[import] service URL or token file is missing"
@@ -52,8 +37,6 @@ while true; do
 
   # Обрабатывает один архив за вызов; если архивов нет — выход 0.
   echo "[import] media scan started"
-  scan_heartbeat &
-  hb_pid=$!
   if /usr/local/bin/archive-import; then
     echo "[import] media scan finished"
     # Если архив был обработан — сразу берём следующий; если пусто — ждём.
@@ -67,7 +50,4 @@ while true; do
     echo "[import] media scan failed (exit=$code); retrying in ${retry_delay}s"
     sleep "$retry_delay"
   fi
-  kill "$hb_pid" 2>/dev/null || true
-  wait "$hb_pid" 2>/dev/null || true
-  unset hb_pid
 done
