@@ -83,7 +83,7 @@ upload_with_heartbeat() {
     cd "$UPLOAD_DIR" || exit 1
     curl -sS -o /dev/null -w '%{http_code}' \
       --retry 3 --retry-delay 2 --retry-all-errors \
-      --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
+      --connect-timeout 30 -m "${UPLOAD_TIMEOUT:-${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}}" \
       "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
   ); then rc=0; else rc=$?; fi
   kill "$heartbeat_pid" 2>/dev/null || true
@@ -549,8 +549,13 @@ process_loose_dir() {
     return 1
   fi
   while IFS= read -r -d '' file; do total=$((total + 1)); done < "$list"
+  # Сначала фото, видео — в конце: зависшее/битое видео не блокирует фото.
+  prioritize_media_list "$list"
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
+    if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$file"; then
+      continue
+    fi
     report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
     hash=""; captured=""; photos_meta=""
     if ! is_video "$file"; then
@@ -598,9 +603,12 @@ process_loose_dir() {
       [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
       [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
       UPLOAD_ENDPOINT="$STREAM_API"
+      # Битое/зависшее чтение видео не должно блокировать очередь на 15 мин.
+      UPLOAD_TIMEOUT="${IMPORT_VIDEO_UPLOAD_TIMEOUT_SECONDS:-180}"
     else
       UPLOAD_ARGS=("${form_args[@]}")
       UPLOAD_ENDPOINT="$API"
+      UPLOAD_TIMEOUT="${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}"
     fi
     UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
     upload_with_heartbeat || true
@@ -787,7 +795,7 @@ if [[ "${1:-}" == "--metadata-backfill" ]]; then
   exit 0
 fi
 # Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
-mapfile -t archives < <(find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
+mapfile -t archives < <(timeout 120 find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
 if (( ${#archives[@]} > 0 )); then
   # Новые архивы имеют приоритет над большой очередью уже распакованных файлов.
   process_archive "${archives[0]}"
