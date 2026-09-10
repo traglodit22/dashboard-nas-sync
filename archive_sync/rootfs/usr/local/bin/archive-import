@@ -466,26 +466,36 @@ find_next_loose_media() {
 }
 
 process_loose_import() {
+  local list="$IMPORT_ROOT/.tmp-loose-files.list"
   local file hash existing captured photos_meta
-  local done=0 skipped=0 failed=0 total=1
+  local done=0 skipped=0 failed=0 total=0
   mkdir -p "$IMPORT_ROOT/.done"
-  if ! find_next_loose_media; then
+  CSV_META_FILE=""
+
+  # Список собираем ОДИН раз за вызов: полный find на медленном NAS дорогой,
+  # а прошлая схема делала обход на каждый файл — импорт почти стоял.
+  find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 > "$list" 2>/dev/null || true
+  prioritize_media_list "$list"
+  while IFS= read -r -d '' file; do is_media "$file" && total=$((total + 1)); done < "$list"
+
+  if [[ "$total" -eq 0 ]]; then
+    rm -f "$list"
     log "no loose media in $IMPORT_ROOT"
     report idle "waiting for Apple media" 0 0 0
     return 0
   fi
-  file="$NEXT_LOOSE_FILE"
-  CSV_META_FILE=""
-  report running "loose files" 0 "$total" 0 "$(basename "$file")"
-  {
+
+  report running "loose files" 0 "$total" 0
+  while IFS= read -r -d '' file; do
+    is_media "$file" || continue
+    report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
     hash=""
     if ! is_video "$file"; then
       hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; return 1
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
       }
       hash="$HASH_VALUE"
-    else
-      report running "loose files" $((done + skipped + failed)) "$total" 0 "uploading $(basename "$file")"
     fi
     existing=""
     if [[ -n "$hash" ]]; then
@@ -504,46 +514,47 @@ process_loose_import() {
       fi
       skipped=$((skipped + 1))
       remove_loose_after_success "$file"
-      report running "loose files" $((done + skipped + failed)) "$total" 0
-      return 0
-    fi
-    local csv_meta csv_favorite csv_keywords csv_people
-    csv_meta="$(csv_metadata_for "$file")"
-    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-    captured="${captured:-$(capture_date_for "$file")}"
-    local http_code file_dir file_base
-    file_dir="$(dirname "$file")"
-    file_base="$(basename "$file")"
-    local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
-    [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
-    [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
-    if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
-      photos_meta="$(photos_metadata_for "$file")"
-      form_args+=(-F "photosMeta=$photos_meta")
-    fi
-    if is_video "$file"; then
-      local stream_type="video/mp4"
-      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
-      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
-      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
-      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
-      UPLOAD_ENDPOINT="$STREAM_API"
     else
-      UPLOAD_ARGS=("${form_args[@]}")
-      UPLOAD_ENDPOINT="$API"
+      local csv_meta csv_favorite csv_keywords csv_people
+      csv_meta="$(csv_metadata_for "$file")"
+      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+      captured="${captured:-$(capture_date_for "$file")}"
+      local http_code file_dir file_base
+      file_dir="$(dirname "$file")"
+      file_base="$(basename "$file")"
+      local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
+      [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
+      [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
+      if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
+        photos_meta="$(photos_metadata_for "$file")"
+        form_args+=(-F "photosMeta=$photos_meta")
+      fi
+      if is_video "$file"; then
+        local stream_type="video/mp4"
+        [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+        UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+        [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+        [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+        UPLOAD_ENDPOINT="$STREAM_API"
+      else
+        UPLOAD_ARGS=("${form_args[@]}")
+        UPLOAD_ENDPOINT="$API"
+      fi
+      UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
+      upload_with_heartbeat || true
+      http_code="$UPLOAD_HTTP_CODE"
+      case "$http_code" in
+        200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
+        413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
+        000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
+        *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+      esac
     fi
-    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
-    upload_with_heartbeat || true
-    http_code="$UPLOAD_HTTP_CODE"
-    case "$http_code" in
-      200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
-      413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
-      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
-      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
-    esac
     update_state "loose files" "$done" "$skipped" "$failed"
-    report running "loose files" $((done + skipped + failed)) "$total" 0 "$file_base"
-  }
+    report running "loose files" $((done + skipped + failed)) "$total" 0
+  done < "$list"
+
+  rm -f "$list"
   prune_empty_import_dirs
   log "done loose files: imported=$done skipped=$skipped failed=$failed"
   if [[ "$failed" -gt 0 ]]; then
