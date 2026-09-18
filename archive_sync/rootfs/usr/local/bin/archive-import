@@ -12,6 +12,12 @@ set -euo pipefail
 : "${IMPORT_DONE_RETENTION_DAYS:=30}"
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
+# Служебные файлы (очередь обхода, временные результаты) держим в записываемом
+# каталоге состояния (/data), а не в IMPORT_ROOT: сетевой шар может разрешать
+# создание файлов, но не перезапись старых служебных файлов.
+IMPORT_STATE_DIR="${IMPORT_STATE_DIR:-$(dirname "$IMPORT_STATE_FILE")}"
+mkdir -p "$IMPORT_STATE_DIR"
+
 API="${DASHBOARD_URL%/}/api/sync/nas/import"
 STREAM_API="${DASHBOARD_URL%/}/api/sync/nas/import/stream"
 CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
@@ -51,7 +57,7 @@ heartbeat() {
 hash_with_heartbeat() {
   local file="$1" label="$2" done="$3" total="$4" pending="$5"
   local result_file heartbeat_pid rc
-  result_file="$(mktemp "$IMPORT_ROOT/.hash-result.XXXXXX")"
+  result_file="$(mktemp "$IMPORT_STATE_DIR/.hash-result.XXXXXX")"
   report running "$label" "$done" "$total" "$pending" "hashing $(basename "$file")"
   heartbeat "$label" "$done" "$total" "$pending" "hashing $(basename "$file")" &
   heartbeat_pid=$!
@@ -75,7 +81,7 @@ UPLOAD_ENDPOINT="$API"
 
 upload_with_heartbeat() {
   local result_file heartbeat_pid rc
-  result_file="$(mktemp "$IMPORT_ROOT/.upload-status.XXXXXX")"
+  result_file="$(mktemp "$IMPORT_STATE_DIR/.upload-status.XXXXXX")"
   report running "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME"
   heartbeat "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME" &
   heartbeat_pid=$!
@@ -362,7 +368,7 @@ PY
 }
 
 metadata_backfill() {
-  local list="$IMPORT_ROOT/.tmp-csv-meta.tsv" file captured hash meta response
+  local list="$IMPORT_STATE_DIR/.tmp-csv-meta.tsv" file captured hash meta response
   local matched=0 updated=0 failed=0 signature previous csv_count
   csv_count="$(find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -print 2>/dev/null | wc -l)"
   if [[ "$csv_count" -eq 0 ]]; then
@@ -626,8 +632,10 @@ process_loose_dir() {
 }
 
 process_loose_import() {
-  local q="$IMPORT_ROOT/.tmp-loose-dirs.list"
-  local tries="$IMPORT_ROOT/.tmp-loose-dir-tries"
+  local q="$IMPORT_STATE_DIR/loose-dirs.list"
+  local tries="$IMPORT_STATE_DIR/loose-dir-tries"
+  # Убираем служебные файлы, которые прежние версии оставили в IMPORT_ROOT.
+  rm -f "$IMPORT_ROOT/.tmp-loose-dirs.list" "$IMPORT_ROOT/.tmp-loose-dir-tries" 2>/dev/null || true
   mkdir -p "$IMPORT_ROOT/.done"
   [[ -s "$q" ]] || build_loose_dir_queue "$q"
   local n=0 dir cnt
@@ -788,6 +796,16 @@ process_archive() {
   report completed "$rel_path" $((done + skipped)) "$total" "$pending"
   purge_done
 }
+
+if [[ ! -d "$IMPORT_ROOT" ]]; then
+  log "IMPORT_ROOT not found: $IMPORT_ROOT"
+  exit 1
+fi
+if ! touch "$IMPORT_ROOT/.import-write-test.$$" 2>/dev/null; then
+  log "IMPORT_ROOT not writable: $IMPORT_ROOT (check the share mount and permissions)"
+  exit 1
+fi
+rm -f "$IMPORT_ROOT/.import-write-test.$$" 2>/dev/null || true
 
 mkdir -p "$IMPORT_ROOT/.done"
 if [[ "${1:-}" == "--metadata-backfill" ]]; then
