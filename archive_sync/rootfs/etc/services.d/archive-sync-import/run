@@ -42,7 +42,7 @@ while true; do
   if /usr/local/bin/archive-import; then
     echo "[import] media scan finished"
     # Если архив был обработан — сразу берём следующий; если пусто — ждём.
-    if [[ -f "$IMPORT_STATE_FILE" ]] && find "$IMPORT_ROOT" -type f -iname '*.zip' \
+    if [[ -f "$IMPORT_STATE_FILE" ]] && timeout 120 find "$IMPORT_ROOT" -type f -iname '*.zip' \
       ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" -print -quit 2>/dev/null | grep -q .; then
       continue
     fi

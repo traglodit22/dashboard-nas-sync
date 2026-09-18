@@ -502,25 +502,21 @@ find_next_loose_media() {
 
 # --- Обход loose-файлов по папкам -------------------------------------------
 # Полный рекурсивный find по всему дереву застревает на больших папках Photos.
-# Вместо него — очередь папок (строится один раз, персистентно): берём папку,
-# листаем её один раз, обрабатываем файлы подряд, при успехе удаляем.
+# Вместо него — персистентная BFS-очередь папок: берём папку из головы, листаем
+# её один раз (maxdepth 1), загружаем файлы, найденные подпапки дописываем в
+# конец очереди. Так обход доходит до любого уровня вложенности. Очередь живёт
+# в IMPORT_STATE_DIR (локальный /data), а не на сетевом шаре.
 # Скан папки ограничен таймаутом; упавшая папка возвращается в конец очереди.
 
 LOOSE_DIR_SCAN_TIMEOUT="${IMPORT_DIR_SCAN_TIMEOUT:-180}"
-LOOSE_DIR_BUDGET="${IMPORT_DIR_BUDGET:-3}"
+# 0 = без ограничения по числу папок (ограничиваем только временем прогона).
+LOOSE_DIR_BUDGET="${IMPORT_DIR_BUDGET:-0}"
+# Максимальная длительность одного прогона обхода, секунды (0 = без лимита).
+LOOSE_RUN_SECONDS="${IMPORT_LOOSE_RUN_SECONDS:-600}"
 
 build_loose_dir_queue() {
-  local q="$1" part sub
-  : > "$q"
-  printf '%s\n' "$IMPORT_ROOT" >> "$q"
-  while IFS= read -r part; do
-    [[ -n "$part" ]] || continue
-    printf '%s\n' "$part" >> "$q"
-    while IFS= read -r sub; do
-      [[ -n "$sub" ]] || continue
-      printf '%s\n' "$sub" >> "$q"
-    done < <(find "$part" -mindepth 1 -maxdepth 1 -type d ! -name '.done' ! -name '.tmp*' 2>/dev/null)
-  done < <(find "$IMPORT_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.done' ! -name '.tmp*' 2>/dev/null)
+  # Начинаем с корня; подпапки добавляются по мере обхода (см. process_loose_dir).
+  printf '%s\n' "$IMPORT_ROOT" > "$1"
 }
 
 # Листинг одной папки с таймаутом и фоновым heartbeat.
@@ -544,7 +540,7 @@ scan_dir_media() {
 }
 
 process_loose_dir() {
-  local dir="$1"
+  local dir="$1" subdirs_out="$2"
   local file hash existing captured photos_meta
   local list done=0 skipped=0 failed=0 total=0
   list="$(mktemp)"
@@ -627,31 +623,55 @@ process_loose_dir() {
     esac
   done < "$list"
   rm -f "$list"
-  log "dir done $(basename "$dir"): imported=$done skipped=$skipped failed=$failed"
+  # Подпапки этого каталога дописываем в очередь: обход доходит до любого уровня.
+  : > "$subdirs_out"
+  if ! find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.done' ! -name '.tmp*' \
+    -print >> "$subdirs_out" 2>/dev/null; then
+    log "warning: cannot list subdirectories: $dir"
+  fi
+  log "dir done $(basename "$dir"): total=$total imported=$done skipped=$skipped failed=$failed"
   return 0
 }
 
 process_loose_import() {
   local q="$IMPORT_STATE_DIR/loose-dirs.list"
   local tries="$IMPORT_STATE_DIR/loose-dir-tries"
+  local sub_tmp
   # Убираем служебные файлы, которые прежние версии оставили в IMPORT_ROOT.
   rm -f "$IMPORT_ROOT/.tmp-loose-dirs.list" "$IMPORT_ROOT/.tmp-loose-dir-tries" 2>/dev/null || true
   mkdir -p "$IMPORT_ROOT/.done"
   [[ -s "$q" ]] || build_loose_dir_queue "$q"
-  local n=0 dir cnt
-  while (( n < LOOSE_DIR_BUDGET )); do
-    dir="$(head -n 1 "$q" 2>/dev/null || true)"
-    if [[ -z "$dir" ]]; then
-      report idle "waiting for Apple media" 0 0 0
+
+  # Очередь держим в памяти (O(1) на элемент), подпапки дописываем по ходу.
+  local -a queue=()
+  mapfile -t queue < "$q"
+  local head=0 n=0 start now dir cnt sub
+  start="$(date +%s)"
+  sub_tmp="$(mktemp "$IMPORT_STATE_DIR/.subdirs.XXXXXX")"
+
+  while (( head < ${#queue[@]} )); do
+    if (( LOOSE_DIR_BUDGET > 0 )) && (( n >= LOOSE_DIR_BUDGET )); then
+      log "dir budget reached ($LOOSE_DIR_BUDGET); continuing next run"
       break
     fi
-    if ! tail -n +2 "$q" > "$q.tmp" 2>/dev/null; then
-      : > "$q.tmp"
+    if (( LOOSE_RUN_SECONDS > 0 )); then
+      now="$(date +%s)"
+      if (( now - start >= LOOSE_RUN_SECONDS )); then
+        log "run time budget reached (${LOOSE_RUN_SECONDS}s); continuing next run"
+        break
+      fi
     fi
-    mv "$q.tmp" "$q" 2>/dev/null || true
+    dir="${queue[$head]}"
+    head=$((head + 1))
     n=$((n + 1))
     [[ -d "$dir" ]] || continue
-    if process_loose_dir "$dir"; then
+    if process_loose_dir "$dir" "$sub_tmp"; then
+      if [[ -s "$sub_tmp" ]]; then
+        while IFS= read -r sub; do
+          [[ -n "$sub" ]] || continue
+          queue+=("$sub")
+        done < "$sub_tmp"
+      fi
       if [[ -f "$tries" ]]; then
         grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null && mv "$tries.tmp" "$tries" || rm -f "$tries.tmp"
       fi
@@ -667,12 +687,26 @@ process_loose_import() {
       printf '%s\t%s\n' "$dir" "$cnt" >> "$tries.tmp"
       mv "$tries.tmp" "$tries" 2>/dev/null || true
       if (( cnt <= 3 )); then
-        printf '%s\n' "$dir" >> "$q"
+        queue+=("$dir")
       else
         log "dir skipped after $cnt failures: $dir"
       fi
     fi
   done
+  rm -f "$sub_tmp"
+
+  # Сохраняем необработанный хвост очереди для следующего прогона.
+  : > "$q"
+  if (( head < ${#queue[@]} )); then
+    printf '%s\n' "${queue[@]:head}" >> "$q"
+  else
+    log "loose walk complete: no directories left"
+    report idle "waiting for Apple media" 0 0 0
+    prune_empty_import_dirs
+  fi
+  local pending
+  pending="$(wc -l < "$q" 2>/dev/null || echo 0)"
+  log "loose batch done: dirs=$n pending=$pending"
   return 0
 }
 
