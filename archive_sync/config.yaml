@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.10.40"
+version: "0.10.41"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -29,6 +29,7 @@ options:
   backup_destination_root: /share/NAS/backups
   backup_project_name: dashboard
   backup_projects_json: "[]"
+  mount_check_enabled: true
   files_enabled: false
   files_root: /share/NAS
   files_token_file: /homeassistant/.nas-files-token
@@ -46,6 +47,8 @@ options:
   import_parallel: 4
   import_skip_videos: false
   import_done_retention_days: 30
+  import_storage_probe_timeout_seconds: 30
+  import_storage_fail_limit: 3
 schema:
   service_url: str
   token_file: str
@@ -56,6 +59,7 @@ schema:
   backup_destination_root: str
   backup_project_name: match(^[a-z0-9][a-z0-9_-]{0,63}$)
   backup_projects_json: str
+  mount_check_enabled: bool
   files_enabled: bool
   files_root: str
   files_token_file: str
@@ -73,3 +77,5 @@ schema:
   import_parallel: int(1,8)
   import_skip_videos: bool
   import_done_retention_days: int(0,3650)
+  import_storage_probe_timeout_seconds: int(5,600)
+  import_storage_fail_limit: int(1,100)

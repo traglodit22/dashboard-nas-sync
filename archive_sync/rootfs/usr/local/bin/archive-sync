@@ -7,13 +7,83 @@ set -euo pipefail
 : "${NAS_BACKUP_ROOT:=/share/NAS/backups}"
 : "${NAS_BACKUP_PROJECT_NAME:=dashboard}"
 : "${NAS_SYNC_BATCH:=100}"
+: "${NAS_MOUNT_BASE:=/share}"
+: "${MOUNT_CHECK_ENABLED:=true}"
+
+log() { printf '[backup] %s\n' "$*" >&2; }
+
+# Проверка «путь лежит на отдельной файловой системе» (реальное монтирование).
+# Сравниваем st_dev пути с st_dev базы NAS_MOUNT_BASE (по умолчанию /share), а не
+# с ближайшим родителем: каталоги назначения вложены внутрь монтирования
+# (/share/NAS/backups), и родитель имеет тот же st_dev.
+# Если путь ещё не существует — поднимаемся до ближайшего существующего предка.
+# Результат: 0 = mounted, 1 = not mounted, 2 = undefined (базы нет, stat недоступен,
+# путь вне базы). Неопределённый результат трактуется как «разрешить».
+MOUNT_CHECK_PATH_DEV=""
+MOUNT_CHECK_BASE_DEV=""
+path_is_mounted() {
+  local p="$1" base="${NAS_MOUNT_BASE:-/share}" probe p_dev base_dev
+  MOUNT_CHECK_PATH_DEV=""
+  MOUNT_CHECK_BASE_DEV=""
+  if [[ "$MOUNT_CHECK_ENABLED" != "true" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$base" ]]; then
+    return 2
+  fi
+  base="${base%/}"
+  case "$p" in
+    "$base"|"$base"/*) ;;
+    *) return 2 ;;
+  esac
+  probe="$p"
+  while [[ ! -e "$probe" ]]; do
+    probe="$(dirname "$probe")"
+    if [[ "$probe" == "/" ]]; then
+      break
+    fi
+  done
+  if [[ ! -d "$probe" ]]; then
+    return 2
+  fi
+  p_dev="$(stat -c '%d' "$probe" 2>/dev/null)" || return 2
+  base_dev="$(stat -c '%d' "$base" 2>/dev/null)" || return 2
+  MOUNT_CHECK_PATH_DEV="$p_dev"
+  MOUNT_CHECK_BASE_DEV="$base_dev"
+  if [[ "$p_dev" == "$base_dev" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# 0 = работать можно, 1 = хранилище не смонтировано (нельзя).
+require_mount() {
+  local p="$1" rc=0
+  path_is_mounted "$p" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      log "storage not mounted: $p (path st_dev=${MOUNT_CHECK_PATH_DEV:-?}, base ${NAS_MOUNT_BASE:-/share} st_dev=${MOUNT_CHECK_BASE_DEV:-?}); refusing to write"
+      return 1
+      ;;
+    *)
+      log "warning: cannot determine mount state for $p; continuing"
+      return 0
+      ;;
+  esac
+}
 
 manifest_url="${DASHBOARD_URL%/}/api/sync/nas/backups/manifest"
 complete_url="${DASHBOARD_URL%/}/api/sync/nas/backups/complete"
 curl_retry=(--retry 6 --retry-delay 2 --retry-max-time 90 --connect-timeout 20 --max-time 180)
 
-mkdir -p "$NAS_BACKUP_ROOT"
 while true; do
+  # Проверка монтирования строго ДО mkdir: каталог <mountpoint>/backups, созданный
+  # на отмонтированной шаре, блокирует восстановление монтирования Supervisor'ом.
+  if ! require_mount "$NAS_BACKUP_ROOT"; then
+    exit 1
+  fi
+  mkdir -p "$NAS_BACKUP_ROOT"
   manifest="$(mktemp)"
   receipt="$(mktemp)"
   trap 'rm -f "$manifest" "$receipt"' RETURN
@@ -37,6 +107,9 @@ while true; do
     [[ -n "$run_id$role$key$relative_path$download_url" ]] || continue
     destination="$NAS_BACKUP_ROOT/$relative_path"
     mkdir -p "$(dirname "$destination")"
+    # Висячие временные файлы прерванных загрузок (только свой паттерн,
+    # готовые архивы не трогаем) убираем до начала скачивания.
+    rm -f -- "$(dirname "$destination")"/*.archive-sync.tmp.* 2>/dev/null || true
     temporary="${destination}.archive-sync.tmp.$$"
     if curl --fail --silent --show-error --location --connect-timeout 30 \
       --speed-time 300 --speed-limit 102400 --retry 2 --retry-delay 5 \

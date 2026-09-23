@@ -12,6 +12,7 @@ backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
 backup_destination_root="$(jq -r '.backup_destination_root // "/share/NAS/backups"' "$options")"
 backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
 backup_projects_json="$(jq -r '.backup_projects_json // "[]"' "$options")"
+mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
 
 export DASHBOARD_URL="$service_url"
 export NAS_BACKUP_ROOT="$backup_destination_root"
@@ -33,7 +34,8 @@ sync_project_backups() {
     [[ -n "$project_token" ]] || continue
     DASHBOARD_URL="$project_url" NAS_SYNC_TOKEN="$project_token" NAS_SYNC_AGENT_ID="$project_worker_id" \
       NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
-      NAS_BACKUP_PROJECT_NAME="$slug" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync
+      NAS_BACKUP_PROJECT_NAME="$slug" NAS_SYNC_BATCH="$batch_size" \
+      MOUNT_CHECK_ENABLED="$mount_check_enabled" /usr/local/bin/archive-sync
   done < <(jq -r '.[] | @base64' <<< "$backup_projects_json")
 }
 
@@ -47,7 +49,8 @@ while true; do
     sync_project_backups || true
     DASHBOARD_URL="$service_url" NAS_SYNC_TOKEN="$NAS_SYNC_TOKEN" NAS_SYNC_AGENT_ID="$worker_id" \
       NAS_BACKUP_ENABLED=true NAS_BACKUP_ONLY=true NAS_BACKUP_ROOT="$backup_destination_root" \
-      NAS_BACKUP_PROJECT_NAME="$backup_project_name" NAS_SYNC_BATCH="$batch_size" /usr/local/bin/archive-sync || true
+      NAS_BACKUP_PROJECT_NAME="$backup_project_name" NAS_SYNC_BATCH="$batch_size" \
+      MOUNT_CHECK_ENABLED="$mount_check_enabled" /usr/local/bin/archive-sync || true
   fi
   sleep "$backup_poll_seconds"
 done

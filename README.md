@@ -47,3 +47,25 @@ default `/share/NAS`), same Bearer token as the sync worker:
   (default `127.0.0.1:18125`) when the user is away from the home LAN.
   Use a dedicated locked-down SSH account on the VPS
   (`permitlisten="127.0.0.1:18125"`, no shell).
+
+## Storage resilience (v0.10.41)
+
+Service processes now refuse to write when the share is not actually mounted.
+The check compares the device id (`st_dev`) of the target path with the one of
+`/share` (override with `NAS_MOUNT_BASE`), so a nested destination such as
+`/share/NAS/backups` is still accepted when the share is mounted. Disable the
+check with `mount_check_enabled: false` if needed.
+
+- `mount_check_enabled` (default `true`) — refuse backup/file-API writes when
+  the share is not a real mount; an undeterminable state only warns.
+- `import_storage_probe_timeout_seconds` (default `30`) — timeout for the
+  importer's read/write probe of `import_root` before each pass.
+- `import_storage_fail_limit` (default `3`) — consecutive storage failures
+  (hash timeout, HTTP 503, connection error) after which the importer stops the
+  pass and reports `error: хранилище недоступно` instead of spinning.
+
+Rationale: if the share is unmounted, `/share/NAS` is a plain directory on the
+HA host. Writing there fills the internal disk, makes the mount point non-empty
+(which blocks the Supervisor from re-mounting the share) and silently loses
+data. Backup runs now also remove stale `*.archive-sync.tmp.*` leftovers before
+downloading.

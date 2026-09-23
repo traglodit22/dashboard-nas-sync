@@ -10,6 +10,10 @@ set -euo pipefail
 : "${IMPORT_PARALLEL:=2}"
 : "${IMPORT_STATE_FILE:=/data/import-state.json}"
 : "${IMPORT_DONE_RETENTION_DAYS:=30}"
+IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS="${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS:-30}"
+IMPORT_STORAGE_FAIL_LIMIT="${IMPORT_STORAGE_FAIL_LIMIT:-3}"
+: "${NAS_MOUNT_BASE:=/share}"
+: "${MOUNT_CHECK_ENABLED:=true}"
 META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
 
 # Служебные файлы (очередь обхода, временные результаты) держим в записываемом
@@ -43,6 +47,134 @@ report() {
   curl -sf --connect-timeout 5 --max-time 10 "${AUTH[@]}" \
     "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
     >/dev/null 2>&1 || true
+}
+
+# --- Проверка реального монтирования и доступности хранилища -----------------
+# Сравниваем st_dev пути с st_dev базы NAS_MOUNT_BASE (по умолчанию /share), а не
+# с ближайшим родителем: IMPORT_ROOT вложен внутрь монтирования (/share/NAS/...),
+# и родитель имеет тот же st_dev. Если путь не существует — поднимаемся до
+# ближайшего существующего предка.
+# Результат: 0 = mounted, 1 = not mounted, 2 = undefined (базы нет, stat
+# недоступен, путь вне базы). Неопределённый результат — «разрешить» с warning.
+MOUNT_CHECK_PATH_DEV=""
+MOUNT_CHECK_BASE_DEV=""
+path_is_mounted() {
+  local p="$1" base="${NAS_MOUNT_BASE:-/share}" probe p_dev base_dev
+  MOUNT_CHECK_PATH_DEV=""
+  MOUNT_CHECK_BASE_DEV=""
+  if [[ "$MOUNT_CHECK_ENABLED" != "true" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$base" ]]; then
+    return 2
+  fi
+  base="${base%/}"
+  case "$p" in
+    "$base"|"$base"/*) ;;
+    *) return 2 ;;
+  esac
+  probe="$p"
+  while [[ ! -e "$probe" ]]; do
+    probe="$(dirname "$probe")"
+    if [[ "$probe" == "/" ]]; then
+      break
+    fi
+  done
+  if [[ ! -d "$probe" ]]; then
+    return 2
+  fi
+  p_dev="$(stat -c '%d' "$probe" 2>/dev/null)" || return 2
+  base_dev="$(stat -c '%d' "$base" 2>/dev/null)" || return 2
+  MOUNT_CHECK_PATH_DEV="$p_dev"
+  MOUNT_CHECK_BASE_DEV="$base_dev"
+  if [[ "$p_dev" == "$base_dev" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Проба доступности: чтение каталога + создание/удаление служебного файла
+# с фиксированным именем .import-probe в IMPORT_ROOT, под таймаутом.
+storage_probe() {
+  local root="$1"
+  timeout -k 5 "$IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS" bash -c '
+    root="$1"
+    ls -1 "$root" >/dev/null 2>&1 || exit 1
+    if ! touch "$root/.import-probe" 2>/dev/null; then
+      rm -f "$root/.import-probe" 2>/dev/null || true
+      exit 1
+    fi
+    rm -f "$root/.import-probe" 2>/dev/null || exit 1
+    exit 0
+  ' storage-probe "$root"
+}
+
+# Предохранитель по серии подряд идущих отказов хранилища.
+STORAGE_FAIL_STREAK=0
+reset_storage_failures() { STORAGE_FAIL_STREAK=0; }
+note_storage_failure() {
+  STORAGE_FAIL_STREAK=$((STORAGE_FAIL_STREAK + 1))
+  if (( STORAGE_FAIL_STREAK >= IMPORT_STORAGE_FAIL_LIMIT )); then
+    log "storage failure streak: $STORAGE_FAIL_STREAK (limit $IMPORT_STORAGE_FAIL_LIMIT); aborting run"
+    report error "хранилище недоступно" 0 0 0
+    exit 1
+  fi
+}
+
+# Guard перед началом прохода: ничего не создаём под IMPORT_ROOT до его успеха.
+storage_guard() {
+  local rc=0
+  path_is_mounted "$IMPORT_ROOT" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      log "storage unavailable: $IMPORT_ROOT is not a real mount (path st_dev=${MOUNT_CHECK_PATH_DEV:-?}, base ${NAS_MOUNT_BASE:-/share} st_dev=${MOUNT_CHECK_BASE_DEV:-?})"
+      report error "хранилище недоступно" 0 0 0
+      exit 1
+      ;;
+    *)
+      log "warning: cannot determine mount state for $IMPORT_ROOT; continuing"
+      ;;
+  esac
+  if ! storage_probe "$IMPORT_ROOT"; then
+    log "storage unavailable: probe failed for $IMPORT_ROOT (read/create/delete test, timeout ${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS}s)"
+    report error "хранилище недоступно" 0 0 0
+    exit 1
+  fi
+  reset_storage_failures
+}
+
+# Дедуп против БД через check-hashes. Заполняет EXISTING_VALUE и CHECK_HTTP_CODE.
+# 2xx → успех (сбрасывает серию отказов); non-2xx/000 → отказ хранилища.
+CHECK_HTTP_CODE="000"
+EXISTING_VALUE=""
+check_hash_existing() {
+  local hash="$1" body code_file
+  EXISTING_VALUE=""
+  CHECK_HTTP_CODE="000"
+  [[ -n "$hash" ]] || return 0
+  body="$(mktemp "$IMPORT_STATE_DIR/.check-hashes.XXXXXX")"
+  code_file="$(mktemp "$IMPORT_STATE_DIR/.check-hashes-code.XXXXXX")"
+  curl -sS -o "$body" -w '%{http_code}' --retry 3 --retry-delay 2 --retry-all-errors -m 30 \
+    "${AUTH[@]}" -H 'Content-Type: application/json' \
+    --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" > "$code_file" 2>/dev/null || true
+  CHECK_HTTP_CODE="$(tail -c 3 "$code_file" 2>/dev/null || true)"
+  [[ "$CHECK_HTTP_CODE" =~ ^[0-9]{3}$ ]] || CHECK_HTTP_CODE="000"
+  rm -f "$code_file"
+  case "$CHECK_HTTP_CODE" in
+    2*)
+      reset_storage_failures
+      EXISTING_VALUE="$(jq -r --arg h "$hash" '.existing[$h] // empty' "$body" 2>/dev/null || true)"
+      rm -f "$body"
+      return 0
+      ;;
+    *)
+      rm -f "$body"
+      log "check-hashes failed (HTTP $CHECK_HTTP_CODE)"
+      note_storage_failure
+      return 1
+      ;;
+  esac
 }
 
 HASH_VALUE=""
@@ -423,6 +555,7 @@ PY
       failed=$((failed + 1))
       continue
     fi
+    reset_storage_failures
     if [[ "$(printf '%s' "$response" | jq -r '.matched // false' 2>/dev/null)" == "true" ]]; then
       matched=$((matched + 1))
       [[ "$(printf '%s' "$response" | jq -r '.updated // false' 2>/dev/null)" == "true" ]] && updated=$((updated + 1))
@@ -450,7 +583,7 @@ purge_done() {
 }
 
 send_metadata_for() {
-  local file="$1" hash="$2" captured="$3" photos_meta="$4" payload
+  local file="$1" hash="$2" captured="$3" photos_meta="$4" payload code
   payload="$(python3 - "$file" "$hash" "$captured" "$photos_meta" <<'PY'
 import json
 import sys
@@ -464,7 +597,12 @@ if photos_meta:
 print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
 PY
   )"
-  curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$payload" "$META_API" >/dev/null 2>&1 || true
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -H 'Content-Type: application/json' \
+    --data-binary "$payload" "$META_API" 2>/dev/null || true)"
+  case "$(printf '%s' "$code" | tail -c 3)" in
+    2*) reset_storage_failures ;;
+  esac
+  return 0
 }
 
 remove_loose_after_success() {
@@ -562,16 +700,13 @@ process_loose_dir() {
     hash=""; captured=""; photos_meta=""
     if ! is_video "$file"; then
       hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; note_storage_failure; continue
       }
       hash="$HASH_VALUE"
     fi
     existing=""
-    if [[ -n "$hash" ]]; then
-      existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
-        --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
-        | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
-    fi
+    check_hash_existing "$hash" || true
+    existing="$EXISTING_VALUE"
     if [[ -n "$existing" ]]; then
       local csv_meta csv_favorite csv_keywords csv_people
       csv_meta="$(csv_metadata_for "$file")"
@@ -616,9 +751,10 @@ process_loose_dir() {
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
-      200|201) done=$((done + 1)); remove_loose_after_success "$file" ;;
+      200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
       413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
-      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
+      503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
+      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
   done < "$list"
@@ -634,6 +770,10 @@ process_loose_dir() {
 }
 
 process_loose_import() {
+  # Guard до любых операций под IMPORT_ROOT: на отмонтированной шаре нельзя
+  # создавать .done и служебные файлы — непустая точка монтирования блокирует
+  # восстановление монтирования Supervisor'ом.
+  storage_guard
   local q="$IMPORT_STATE_DIR/loose-dirs.list"
   local tries="$IMPORT_STATE_DIR/loose-dir-tries"
   local sub_tmp
@@ -747,16 +887,15 @@ process_archive() {
     hash=""
     if ! is_video "$file"; then
       hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; continue
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; note_storage_failure; continue
       }
       hash="$HASH_VALUE"
     else
       report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "uploading $(basename "$file")"
     fi
     # Дедуп против БД
-    existing="$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors -m 30 "${AUTH[@]}" -H 'Content-Type: application/json' \
-      --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" 2>/dev/null \
-      | jq -r --arg h "$hash" '.existing[$h] // empty' 2>/dev/null || true)"
+    check_hash_existing "$hash" || true
+    existing="$EXISTING_VALUE"
     if [[ -n "$existing" ]]; then
       local csv_meta csv_favorite csv_keywords csv_people
       csv_meta="$(csv_metadata_for "$file")"
@@ -800,9 +939,10 @@ process_archive() {
     upload_with_heartbeat || true
     http_code="$UPLOAD_HTTP_CODE"
     case "$http_code" in
-      200|201) done=$((done + 1)) ;;
+      200|201) done=$((done + 1)); reset_storage_failures ;;
       413) skipped=$((skipped + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
-      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base" ;;
+      503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
+      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
@@ -831,15 +971,10 @@ process_archive() {
   purge_done
 }
 
-if [[ ! -d "$IMPORT_ROOT" ]]; then
-  log "IMPORT_ROOT not found: $IMPORT_ROOT"
-  exit 1
-fi
-if ! touch "$IMPORT_ROOT/.import-write-test.$$" 2>/dev/null; then
-  log "IMPORT_ROOT not writable: $IMPORT_ROOT (check the share mount and permissions)"
-  exit 1
-fi
-rm -f "$IMPORT_ROOT/.import-write-test.$$" 2>/dev/null || true
+# Guard вместо прежнего безусловного write-test: проверка монтирования + проба
+# чтения/записи под таймаутом. Выполняется до любых mkdir под IMPORT_ROOT
+# (включая .done ниже) и до веток --metadata-backfill / архивов / loose.
+storage_guard
 
 mkdir -p "$IMPORT_ROOT/.done"
 if [[ "${1:-}" == "--metadata-backfill" ]]; then

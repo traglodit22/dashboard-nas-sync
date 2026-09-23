@@ -6,6 +6,7 @@ options=/data/options.json
 files_enabled="$(jq -r '.files_enabled // false' "$options")"
 files_root="$(jq -r '.files_root // "/share/NAS"' "$options")"
 token_file="$(jq -r '.token_file' "$options")"
+mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
 
 if [[ "$files_enabled" != "true" ]]; then
   echo "File API disabled (files_enabled != true)"
@@ -23,5 +24,6 @@ export NAS_FILES_ENABLED="true"
 export NAS_FILES_ROOT="$files_root"
 export NAS_TLS_PORT="$tls_port"
 export NAS_TLS_CERT_DIR="$tls_cert_dir"
+export MOUNT_CHECK_ENABLED="$mount_check_enabled"
 
 exec archive-sync-api

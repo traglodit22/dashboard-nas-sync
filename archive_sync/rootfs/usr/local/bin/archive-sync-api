@@ -28,6 +28,12 @@ EXTRA_TOKEN_FILE = os.environ.get("NAS_FILES_TOKEN_FILE", "")
 FILES_ENABLED = os.environ.get("NAS_FILES_ENABLED", "false").lower() == "true"
 FILES_ROOT = os.path.realpath(os.environ.get("NAS_FILES_ROOT", "/share/NAS"))
 
+# Проверка реального монтирования: st_dev пути против st_dev базы NAS_MOUNT_BASE.
+# Сравнение с базой (по умолчанию /share), а не с родителем: FILES_ROOT вложен
+# внутрь монтирования (/share/NAS), и родитель имеет тот же st_dev.
+MOUNT_CHECK_ENABLED = os.environ.get("MOUNT_CHECK_ENABLED", "true").lower() == "true"
+NAS_MOUNT_BASE = os.environ.get("NAS_MOUNT_BASE", "/share")
+
 # HTTPS для LAN-браузеров (mixed content: https-дашборд не может ходить на http).
 TLS_PORT = int(os.environ.get("NAS_TLS_PORT", "8443"))
 TLS_CERT_DIR = os.environ.get("NAS_TLS_CERT_DIR", "/share/NAS/.tls/nas.plansolo.ru")
@@ -149,6 +155,52 @@ def parse_range(header, size):
     return (start, min(end, size - 1))
 
 
+# --- Проверка реального монтирования (True = mounted, False = нет, None = неизвестно) ---
+
+_MOUNT_STATE_CACHE = {}
+_MOUNT_STATE_LOCK = threading.Lock()
+_MOUNT_STATE_TTL_SECONDS = 5.0
+
+
+def _mount_state_uncached(path):
+    base = NAS_MOUNT_BASE
+    if not os.path.isdir(base):
+        return None
+    if path != base and not path.startswith(base.rstrip(os.sep) + os.sep):
+        return None
+    try:
+        base_dev = os.stat(base).st_dev
+    except OSError:
+        return None
+    # Путь может ещё не существовать — поднимаемся до ближайшего существующего предка.
+    probe = path
+    while True:
+        try:
+            path_dev = os.stat(probe).st_dev
+            break
+        except OSError:
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                return None
+            probe = parent
+    return path_dev != base_dev
+
+
+def mount_state(path):
+    """Проверка монтирования с кэшем на 5 секунд (по пути)."""
+    if not MOUNT_CHECK_ENABLED:
+        return True
+    now = time.monotonic()
+    with _MOUNT_STATE_LOCK:
+        cached = _MOUNT_STATE_CACHE.get(path)
+        if cached is not None and now - cached[0] < _MOUNT_STATE_TTL_SECONDS:
+            return cached[1]
+    result = _mount_state_uncached(path)
+    with _MOUNT_STATE_LOCK:
+        _MOUNT_STATE_CACHE[path] = (now, result)
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -174,6 +226,11 @@ class Handler(BaseHTTPRequestHandler):
     def _guard_files(self):
         if not FILES_ENABLED:
             self.send_json(403, {"error": "files API disabled"})
+            return False
+        # Единая точка для stat/list/exists/GET/HEAD/PUT/DELETE: ни чтение, ни
+        # запись, ни удаление не работают, если корень не реальное монтирование.
+        if mount_state(FILES_ROOT) is False:
+            self.send_json(503, {"error": "storage not mounted"})
             return False
         return True
 

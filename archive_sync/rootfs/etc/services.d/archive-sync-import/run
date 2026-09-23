@@ -9,6 +9,9 @@ import_root="$(jq -r '.import_root // "/share/NAS/apple-import"' "$options")"
 import_parallel="$(jq -r '.import_parallel // 2' "$options")"
 skip_videos="$(jq -r '.import_skip_videos // false' "$options")"
 done_retention_days="$(jq -r '.import_done_retention_days // 30' "$options")"
+mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
+import_probe_timeout="$(jq -r '.import_storage_probe_timeout_seconds // 30' "$options")"
+import_fail_limit="$(jq -r '.import_storage_fail_limit // 3' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
 
 if [[ "$import_enabled" != "true" ]]; then
@@ -23,6 +26,9 @@ export IMPORT_ROOT="$import_root"
 export IMPORT_PARALLEL="$import_parallel"
 export IMPORT_SKIP_VIDEOS="$skip_videos"
 export IMPORT_DONE_RETENTION_DAYS="$done_retention_days"
+export MOUNT_CHECK_ENABLED="$mount_check_enabled"
+export IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS="$import_probe_timeout"
+export IMPORT_STORAGE_FAIL_LIMIT="$import_fail_limit"
 export IMPORT_STATE_FILE="/data/import-state.json"
 
 read_token() {
