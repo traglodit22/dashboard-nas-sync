@@ -1,0 +1,1088 @@
+#!/usr/bin/env bash
+# Импорт Apple-архивов (zip) в галерею дашборда.
+# Берёт первый .zip из $IMPORT_ROOT, распаковывает, загружает медиа через API,
+# помечает архив обработанным. Даты: EXIF → JSON-спутник Apple → имя файла.
+set -euo pipefail
+
+: "${DASHBOARD_URL:?service URL is required}"
+: "${NAS_SYNC_TOKEN:?access token is required}"
+: "${IMPORT_ROOT:=/share/NAS/apple-import}"
+: "${IMPORT_PARALLEL:=2}"
+: "${IMPORT_STATE_FILE:=/data/import-state.json}"
+: "${IMPORT_DONE_RETENTION_DAYS:=30}"
+IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS="${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS:-30}"
+IMPORT_STORAGE_FAIL_LIMIT="${IMPORT_STORAGE_FAIL_LIMIT:-3}"
+: "${NAS_MOUNT_BASE:=/share}"
+: "${MOUNT_CHECK_ENABLED:=true}"
+META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
+
+# Служебные файлы (очередь обхода, временные результаты) держим в записываемом
+# каталоге состояния (/data), а не в IMPORT_ROOT: сетевой шар может разрешать
+# создание файлов, но не перезапись старых служебных файлов.
+IMPORT_STATE_DIR="${IMPORT_STATE_DIR:-$(dirname "$IMPORT_STATE_FILE")}"
+mkdir -p "$IMPORT_STATE_DIR"
+
+API="${DASHBOARD_URL%/}/api/sync/nas/import"
+STREAM_API="${DASHBOARD_URL%/}/api/sync/nas/import/stream"
+CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
+META_API="${DASHBOARD_URL%/}/api/sync/nas/import/metadata"
+STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
+AUTH=(-H "Authorization: Bearer $NAS_SYNC_TOKEN" -H "X-NAS-Agent-Id: archive-import")
+
+log() { printf '[import] %s\n' "$*" >&2; }
+fail() { printf '[import] FAILED at %s: %s\n' "$1" "$2" >&2; exit 1; }
+
+update_state() {
+  printf '{"archive":"%s","done":%s,"skipped":%s,"failed":%s,"updatedAt":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)" > "$IMPORT_STATE_FILE.tmp" 2>/dev/null \
+    && mv -f "$IMPORT_STATE_FILE.tmp" "$IMPORT_STATE_FILE" 2>/dev/null || true
+}
+
+# Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
+# archives_left — сколько zip ещё ждёт в папке (без текущего).
+report() {
+  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
+  local label="$archive"
+  [[ -n "$file" ]] && label="$label :: $file"
+  curl -sf --connect-timeout 5 --max-time 10 "${AUTH[@]}" \
+    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
+    >/dev/null 2>&1 || true
+}
+
+# --- Проверка реального монтирования и доступности хранилища -----------------
+# Сравниваем st_dev пути с st_dev базы NAS_MOUNT_BASE (по умолчанию /share), а не
+# с ближайшим родителем: IMPORT_ROOT вложен внутрь монтирования (/share/NAS/...),
+# и родитель имеет тот же st_dev. Если путь не существует — поднимаемся до
+# ближайшего существующего предка.
+# Результат: 0 = mounted, 1 = not mounted, 2 = undefined (базы нет, stat
+# недоступен, путь вне базы). Неопределённый результат — «разрешить» с warning.
+MOUNT_CHECK_PATH_DEV=""
+MOUNT_CHECK_BASE_DEV=""
+path_is_mounted() {
+  local p="$1" base="${NAS_MOUNT_BASE:-/share}" probe p_dev base_dev
+  MOUNT_CHECK_PATH_DEV=""
+  MOUNT_CHECK_BASE_DEV=""
+  if [[ "$MOUNT_CHECK_ENABLED" != "true" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$base" ]]; then
+    return 2
+  fi
+  base="${base%/}"
+  case "$p" in
+    "$base"|"$base"/*) ;;
+    *) return 2 ;;
+  esac
+  probe="$p"
+  while [[ ! -e "$probe" ]]; do
+    probe="$(dirname "$probe")"
+    if [[ "$probe" == "/" ]]; then
+      break
+    fi
+  done
+  if [[ ! -d "$probe" ]]; then
+    return 2
+  fi
+  p_dev="$(stat -c '%d' "$probe" 2>/dev/null)" || return 2
+  base_dev="$(stat -c '%d' "$base" 2>/dev/null)" || return 2
+  MOUNT_CHECK_PATH_DEV="$p_dev"
+  MOUNT_CHECK_BASE_DEV="$base_dev"
+  if [[ "$p_dev" == "$base_dev" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Проба доступности: чтение каталога + создание/удаление служебного файла
+# с фиксированным именем .import-probe в IMPORT_ROOT, под таймаутом.
+storage_probe() {
+  local root="$1"
+  timeout -k 5 "$IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS" bash -c '
+    root="$1"
+    ls -1 "$root" >/dev/null 2>&1 || exit 1
+    if ! touch "$root/.import-probe" 2>/dev/null; then
+      rm -f "$root/.import-probe" 2>/dev/null || true
+      exit 1
+    fi
+    rm -f "$root/.import-probe" 2>/dev/null || exit 1
+    exit 0
+  ' storage-probe "$root"
+}
+
+# Предохранитель по серии подряд идущих отказов хранилища.
+STORAGE_FAIL_STREAK=0
+reset_storage_failures() { STORAGE_FAIL_STREAK=0; }
+note_storage_failure() {
+  STORAGE_FAIL_STREAK=$((STORAGE_FAIL_STREAK + 1))
+  if (( STORAGE_FAIL_STREAK >= IMPORT_STORAGE_FAIL_LIMIT )); then
+    log "storage failure streak: $STORAGE_FAIL_STREAK (limit $IMPORT_STORAGE_FAIL_LIMIT); aborting run"
+    report error "хранилище недоступно" 0 0 0
+    exit 1
+  fi
+}
+
+# Guard перед началом прохода: ничего не создаём под IMPORT_ROOT до его успеха.
+storage_guard() {
+  local rc=0
+  path_is_mounted "$IMPORT_ROOT" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      log "storage unavailable: $IMPORT_ROOT is not a real mount (path st_dev=${MOUNT_CHECK_PATH_DEV:-?}, base ${NAS_MOUNT_BASE:-/share} st_dev=${MOUNT_CHECK_BASE_DEV:-?})"
+      report error "хранилище недоступно" 0 0 0
+      exit 1
+      ;;
+    *)
+      log "warning: cannot determine mount state for $IMPORT_ROOT; continuing"
+      ;;
+  esac
+  if ! storage_probe "$IMPORT_ROOT"; then
+    log "storage unavailable: probe failed for $IMPORT_ROOT (read/create/delete test, timeout ${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS}s)"
+    report error "хранилище недоступно" 0 0 0
+    exit 1
+  fi
+  reset_storage_failures
+}
+
+# Дедуп против БД через check-hashes. Заполняет EXISTING_VALUE и CHECK_HTTP_CODE.
+# 2xx → успех (сбрасывает серию отказов); non-2xx/000 → отказ хранилища.
+CHECK_HTTP_CODE="000"
+EXISTING_VALUE=""
+check_hash_existing() {
+  local hash="$1" body code_file
+  EXISTING_VALUE=""
+  CHECK_HTTP_CODE="000"
+  [[ -n "$hash" ]] || return 0
+  body="$(mktemp "$IMPORT_STATE_DIR/.check-hashes.XXXXXX")"
+  code_file="$(mktemp "$IMPORT_STATE_DIR/.check-hashes-code.XXXXXX")"
+  curl -sS -o "$body" -w '%{http_code}' --retry 3 --retry-delay 2 --retry-all-errors -m 30 \
+    "${AUTH[@]}" -H 'Content-Type: application/json' \
+    --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" > "$code_file" 2>/dev/null || true
+  CHECK_HTTP_CODE="$(tail -c 3 "$code_file" 2>/dev/null || true)"
+  [[ "$CHECK_HTTP_CODE" =~ ^[0-9]{3}$ ]] || CHECK_HTTP_CODE="000"
+  rm -f "$code_file"
+  case "$CHECK_HTTP_CODE" in
+    2*)
+      reset_storage_failures
+      EXISTING_VALUE="$(jq -r --arg h "$hash" '.existing[$h] // empty' "$body" 2>/dev/null || true)"
+      rm -f "$body"
+      return 0
+      ;;
+    *)
+      rm -f "$body"
+      log "check-hashes failed (HTTP $CHECK_HTTP_CODE)"
+      note_storage_failure
+      return 1
+      ;;
+  esac
+}
+
+HASH_VALUE=""
+
+# Файлов, обработанных за текущий прогон loose-обхода (для статуса без total).
+RUN_PROCESSED=0
+
+heartbeat() {
+  local label="$1" done="$2" total="$3" pending="$4" stage="$5"
+  while sleep 30; do
+    report running "$label" "$done" "$total" "$pending" "$stage"
+  done
+}
+
+hash_with_heartbeat() {
+  local file="$1" label="$2" done="$3" total="$4" pending="$5"
+  local result_file heartbeat_pid rc
+  result_file="$(mktemp "$IMPORT_STATE_DIR/.hash-result.XXXXXX")"
+  report running "$label" "$done" "$total" "$pending" "hashing $(basename "$file")"
+  heartbeat "$label" "$done" "$total" "$pending" "hashing $(basename "$file")" &
+  heartbeat_pid=$!
+  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then rc=0; else rc=$?; fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
+  rm -f "$result_file"
+  [[ "$rc" -eq 0 && "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
+}
+
+UPLOAD_HTTP_CODE="000"
+UPLOAD_CURL_RC=0
+UPLOAD_DIR=""
+UPLOAD_LABEL=""
+UPLOAD_DONE=0
+UPLOAD_TOTAL=0
+UPLOAD_PENDING=0
+UPLOAD_FILE_NAME=""
+UPLOAD_ARGS=()
+UPLOAD_ENDPOINT="$API"
+
+upload_with_heartbeat() {
+  local result_file heartbeat_pid rc
+  result_file="$(mktemp "$IMPORT_STATE_DIR/.upload-status.XXXXXX")"
+  report running "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME"
+  heartbeat "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME" &
+  heartbeat_pid=$!
+  if (
+    cd "$UPLOAD_DIR" || exit 1
+    curl -sS -o /dev/null -w '%{http_code}' \
+      --retry 3 --retry-delay 2 --retry-all-errors \
+      --connect-timeout 30 -m "${UPLOAD_TIMEOUT:-${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}}" \
+      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
+  ); then rc=0; else rc=$?; fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
+  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  UPLOAD_CURL_RC="$rc"
+  rm -f "$result_file"
+  return "$rc"
+}
+
+# Хеш без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
+hash_value_of() {
+  local file="$1" result_file
+  result_file="$(mktemp)"
+  HASH_VALUE=""
+  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then
+    HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
+  fi
+  rm -f "$result_file"
+  [[ "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
+}
+
+# Аплоад без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
+upload_quiet() {
+  local result_file rc
+  result_file="$(mktemp)"
+  if (
+    cd "$UPLOAD_DIR" || exit 1
+    curl -sS -o /dev/null -w '%{http_code}' \
+      --retry 3 --retry-delay 2 --retry-all-errors \
+      --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
+      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
+  ); then rc=0; else rc=$?; fi
+  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
+  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  UPLOAD_CURL_RC="$rc"
+  rm -f "$result_file"
+  return "$rc"
+}
+
+# Сколько zip-архивов осталось (рекурсивно, включая подпапки).
+count_pending_archives() {
+  find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
+}
+
+# Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
+capture_date_for() {
+  local file="$1" base dt
+  # Photo Details*.csv is the most reliable source for exported videos, which
+  # usually have no readable EXIF metadata.
+  if [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]]; then
+    local csv_name csv_date
+    while IFS=$'\t' read -r csv_name csv_date _; do
+      if [[ "$csv_name" == "$(basename "$file")" ]]; then
+        printf '%s' "$csv_date"
+        return 0
+      fi
+    done < "$CSV_META_FILE"
+  fi
+  # EXIF (exiftool): DateTimeOriginal / CreateDate
+  dt="$(timeout -k 5 30 exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
+  if [[ -n "$dt" ]]; then printf '%s' "$dt"; return 0; fi
+  # JSON-спутник Apple Takeout: <name>.json рядом
+  base="${file%.*}"
+  for json in "$file.json" "$base.json"; do
+    if [[ -f "$json" ]]; then
+      dt="$(jq -r '.photoTakenTime.formatted // .creationTime.formatted // empty' "$json" 2>/dev/null || true)"
+      if [[ -n "$dt" ]]; then
+        # "11 февр. 2026 г., 14:19:14 UTC" → не парсим; берём timestamp если есть
+        local ts
+        ts="$(jq -r '.photoTakenTime.timestamp // .creationTime.timestamp // empty' "$json" 2>/dev/null || true)"
+        if [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]]; then
+          printf '%s' "$(date -u -d "@$ts" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
+          return 0
+        fi
+      fi
+    fi
+  done
+  # Имя файла: IMG_20260211_141914, 2026-02-11 14.19.14, 20260211_141914
+  local name re
+  name="$(basename "$file")"
+  re='(20[0-9]{2})[-_]?([01][0-9])[-_]?([0-3][0-9])[-_ ]?([0-2][0-9])[-.:]?([0-5][0-9])[-.:]?([0-5][0-9])?'
+  if [[ "$name" =~ $re ]]; then
+    printf '%s-%s-%sT%s:%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+      "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-00}" "${BASH_REMATCH[6]:-00}"
+    return 0
+  fi
+  printf ''
+}
+
+is_media() {
+  local f
+  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$f" in
+    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.tif|*.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_video() {
+  local f
+  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$f" in
+    *.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prioritize_media_list() {
+  local list="$1"
+  python3 - "$list" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, 'rb') as handle:
+    files = [item for item in handle.read().split(b'\0') if item]
+video = {b'.mov', b'.mp4', b'.m4v', b'.3gp'}
+files.sort(key=lambda item: (os.path.splitext(item.lower())[1] in video, item.lower()))
+with open(path, 'wb') as handle:
+    for item in files:
+        handle.write(item + b'\0')
+PY
+}
+
+# Экранирование имени файла для curl -F "file=@\"...\"": внутри кавычек curl
+# понимает \\ и \", а , ; и ведущий @ становятся литеральными.
+curl_form_filename() {
+  local name="$1"
+  name="${name//\\/\\\\}"
+  name="${name//\"/\\\"}"
+  printf '%s' "$name"
+}
+
+build_csv_metadata() {
+  local source_root="$1" output="$2"
+  # Apple/Photos exports differ in column names. Keep only rows that have a
+  # filename and a machine-readable capture date; other CSV columns remain
+  # available in .done for manual inspection.
+  python3 - "$source_root" "$output" <<'PY'
+import csv
+import datetime as dt
+import os
+import re
+import sys
+
+root, output = sys.argv[1:]
+name_words = ('filename', 'file name', 'original filename', 'original name', 'media name')
+date_words = ('date', 'capture date', 'date taken', 'creation date', 'created date', 'time')
+favorite_words = ('favorite', 'is favorite', 'favourite')
+keyword_words = ('keywords', 'keyword', 'tags', 'tag')
+people_words = ('people', 'person', 'faces', 'face names')
+
+def normalize(value):
+    return re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
+
+def parse_date(value):
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        try:
+            return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    value = re.sub(r'\s*(UTC|GMT|Z)$', '+00:00', value, flags=re.I)
+    for candidate in (value, value.replace('/', '-')):
+        try:
+            parsed = dt.datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.isoformat()
+        except ValueError:
+            pass
+    for fmt in (
+        '%Y:%m:%d %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d',
+        '%m/%d/%Y %H:%M:%S',
+        '%B %d, %Y, %H:%M:%S',
+        '%b %d, %Y, %H:%M:%S',
+    ):
+        try:
+            return dt.datetime.strptime(value, fmt).replace(tzinfo=dt.timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return None
+
+rows = {}
+for current, dirs, files in os.walk(root):
+    dirs[:] = [d for d in dirs if d not in ('.done',) and not d.startswith('.tmp.')]
+    for filename in files:
+        if not filename.lower().endswith('.csv'):
+            continue
+        csv_path = os.path.join(current, filename)
+        try:
+            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    continue
+                fields = [(field, normalize(field)) for field in reader.fieldnames if field]
+                name_field = next((field for field, key in fields if any(word in key for word in name_words)), None)
+                date_field = next(
+                    (
+                        field
+                        for field, key in fields
+                        if key in ('date taken', 'photo taken', 'capture date', 'creation date', 'created date', 'date')
+                    ),
+                    None,
+                )
+                date_field = date_field or next(
+                    (field for field, key in fields if any(word in key for word in ('captured', 'taken', 'created', 'creation'))),
+                    None,
+                )
+                date_field = date_field or next(
+                    (field for field, key in fields if key in ('time', 'capture time')), None
+                )
+                time_field = next((field for field, key in fields if key in ('time', 'capture time')), None)
+                favorite_field = next(
+                    (field for field, key in fields if any(word in key for word in favorite_words)), None
+                )
+                keyword_field = next(
+                    (field for field, key in fields if any(word in key for word in keyword_words)), None
+                )
+                people_field = next(
+                    (field for field, key in fields if any(word in key for word in people_words)), None
+                )
+                if not name_field or not date_field:
+                    continue
+                for row in reader:
+                    name = os.path.basename((row.get(name_field) or '').strip())
+                    date_value = (row.get(date_field) or '').strip()
+                    time_value = (row.get(time_field) or '').strip() if time_field else ''
+                    date = parse_date(f'{date_value} {time_value}'.strip())
+                    if name and date:
+                        favorite = (row.get(favorite_field) or '').strip().lower() if favorite_field else ''
+                        if favorite in ('yes', 'true', '1', 'y', 'да'):
+                            favorite = 'true'
+                        elif favorite in ('no', 'false', '0', 'n', 'нет'):
+                            favorite = 'false'
+                        else:
+                            favorite = ''
+                        keywords = (row.get(keyword_field) or '').strip() if keyword_field else ''
+                        people = (row.get(people_field) or '').strip() if people_field else ''
+                        rows[name] = (date, favorite, keywords, people)
+        except (OSError, UnicodeError, csv.Error):
+            continue
+
+with open(output, 'w', encoding='utf-8') as handle:
+    for name, fields in sorted(rows.items()):
+        values = '\t'.join(fields)
+        handle.write(f'{name}\t{values}\n')
+PY
+}
+
+csv_metadata_for() {
+  local file="$1" csv_name csv_date csv_favorite csv_keywords csv_people
+  [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]] || return 0
+  while IFS=$'\t' read -r csv_name csv_date csv_favorite csv_keywords csv_people; do
+    if [[ "$csv_name" == "$(basename "$file")" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "$csv_date" "$csv_favorite" "$csv_keywords" "$csv_people"
+      return 0
+    fi
+  done < "$CSV_META_FILE"
+}
+
+photos_metadata_for() {
+  local file="$1" csv_meta csv_favorite csv_keywords csv_people
+  csv_meta="$(csv_metadata_for "$file")"
+  IFS=$'\t' read -r _ csv_favorite csv_keywords csv_people <<< "$csv_meta"
+  [[ -n "$csv_favorite$csv_keywords$csv_people" ]] || return 0
+  python3 - "$csv_favorite" "$csv_keywords" "$csv_people" <<'PY'
+import json
+import sys
+
+favorite, keywords, people = sys.argv[1:]
+out = {}
+if favorite in ('true', 'false'):
+    out['favorite'] = favorite == 'true'
+if keywords:
+    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
+if people:
+    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+}
+
+metadata_backfill() {
+  local list="$IMPORT_STATE_DIR/.tmp-csv-meta.tsv" file captured hash meta response
+  local matched=0 updated=0 failed=0 signature previous csv_count
+  csv_count="$(find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -print 2>/dev/null | wc -l)"
+  if [[ "$csv_count" -eq 0 ]]; then
+    log "no CSV metadata in $IMPORT_ROOT/.done"
+    purge_done
+    return 0
+  fi
+  signature="$({
+    find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -printf 'csv\t%p\t%s\t%T@\n' 2>/dev/null
+    find "$IMPORT_ROOT/.done" -type f \( \
+      -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
+      -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
+      -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
+      -o -iname '*.3gp' \
+    \) -printf 'media\t%p\t%s\t%T@\n' 2>/dev/null
+  } | sort | sha256sum | cut -d' ' -f1)"
+  if [[ -f "$META_STATE_FILE" ]]; then
+    IFS= read -r previous < "$META_STATE_FILE" || true
+    if [[ "$previous" == "$signature" ]]; then
+      return 0
+    fi
+  fi
+  build_csv_metadata "$IMPORT_ROOT/.done" "$list"
+  [[ -s "$list" ]] || { rm -f "$list"; log "CSV metadata has no usable rows"; return 0; }
+
+  while IFS=$'\t' read -r file captured favorite keywords people; do
+    local media
+    media="$(find "$IMPORT_ROOT/.done" -type f -iname "$file" -print -quit 2>/dev/null || true)"
+    [[ -n "$media" ]] || continue
+    hash="$(sha256sum "$media" | cut -d' ' -f1)"
+    meta="$(python3 - "$file" "$hash" "$captured" "$favorite" "$keywords" "$people" <<'PY'
+import json
+import sys
+
+name, content_hash, captured_at, favorite, keywords, people = sys.argv[1:]
+out = {
+    'originalName': name,
+    'contentHash': content_hash,
+    'capturedAt': captured_at,
+}
+if favorite in ('true', 'false'):
+    out['favorite'] = favorite == 'true'
+if keywords:
+    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
+if people:
+    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+    )"
+    response="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$meta" "$META_API" 2>/dev/null || true)"
+    if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e . >/dev/null 2>&1; then
+      failed=$((failed + 1))
+      continue
+    fi
+    reset_storage_failures
+    if [[ "$(printf '%s' "$response" | jq -r '.matched // false' 2>/dev/null)" == "true" ]]; then
+      matched=$((matched + 1))
+      [[ "$(printf '%s' "$response" | jq -r '.updated // false' 2>/dev/null)" == "true" ]] && updated=$((updated + 1))
+    fi
+  done < "$list"
+  rm -f "$list"
+  if [[ "$failed" -gt 0 ]]; then
+    log "metadata backfill: matched=$matched updated=$updated failed=$failed"
+    return 1
+  fi
+  mkdir -p "$(dirname "$META_STATE_FILE")"
+  printf '%s\n' "$signature" > "$META_STATE_FILE"
+  log "metadata backfill: matched=$matched updated=$updated"
+  purge_done
+}
+
+purge_done() {
+  find "$IMPORT_ROOT/.done" -type f \( \
+    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
+    -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
+    -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
+    -o -iname '*.3gp' -o -iname '*.zip' \
+  \) -delete 2>/dev/null || true
+  find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
+}
+
+send_metadata_for() {
+  local file="$1" hash="$2" captured="$3" photos_meta="$4" payload code
+  payload="$(python3 - "$file" "$hash" "$captured" "$photos_meta" <<'PY'
+import json
+import sys
+
+name, content_hash, captured_at, photos_meta = sys.argv[1:]
+out = {'originalName': name, 'contentHash': content_hash}
+if captured_at:
+    out['capturedAt'] = captured_at
+if photos_meta:
+    out.update(json.loads(photos_meta))
+print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
+PY
+  )"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -H 'Content-Type: application/json' \
+    --data-binary "$payload" "$META_API" 2>/dev/null || true)"
+  case "$(printf '%s' "$code" | tail -c 3)" in
+    2*) reset_storage_failures ;;
+  esac
+  return 0
+}
+
+remove_loose_after_success() {
+  rm -f -- "$1"
+}
+
+prune_empty_import_dirs() {
+  find "$IMPORT_ROOT" -depth -type d \
+    ! -path "$IMPORT_ROOT" \
+    ! -path "$IMPORT_ROOT/.done" \
+    ! -path "$IMPORT_ROOT/.done/*" \
+    ! -path "$IMPORT_ROOT/.tmp.*" \
+    -empty -delete 2>/dev/null || true
+}
+
+find_next_loose_media() {
+  local file
+  NEXT_LOOSE_FILE=""
+  while IFS= read -r -d '' file; do
+    if is_media "$file" && ! is_video "$file"; then
+      NEXT_LOOSE_FILE="$file"
+      return 0
+    fi
+  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 2>/dev/null)
+  while IFS= read -r -d '' file; do
+    if is_media "$file"; then
+      NEXT_LOOSE_FILE="$file"
+      return 0
+    fi
+  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
+    ! -name '*.csv' -print0 2>/dev/null)
+  return 1
+}
+
+# --- Обход loose-файлов по папкам -------------------------------------------
+# Полный рекурсивный find по всему дереву застревает на больших папках Photos.
+# Вместо него — персистентная BFS-очередь папок: берём папку из головы, листаем
+# её один раз (maxdepth 1), загружаем файлы, найденные подпапки дописываем в
+# конец очереди. Так обход доходит до любого уровня вложенности. Очередь живёт
+# в IMPORT_STATE_DIR (локальный /data), а не на сетевом шаре.
+# Скан папки ограничен таймаутом; упавшая папка возвращается в конец очереди.
+
+LOOSE_DIR_SCAN_TIMEOUT="${IMPORT_DIR_SCAN_TIMEOUT:-180}"
+# Значение из окружения принимаем только как целое > 0; иначе — безопасное 180.
+if ! [[ "$LOOSE_DIR_SCAN_TIMEOUT" =~ ^[0-9]+$ ]] || (( LOOSE_DIR_SCAN_TIMEOUT <= 0 )); then
+  LOOSE_DIR_SCAN_TIMEOUT=180
+fi
+# 0 = без ограничения по числу папок (ограничиваем только временем прогона).
+LOOSE_DIR_BUDGET="${IMPORT_DIR_BUDGET:-0}"
+# Максимальная длительность одного прогона обхода, секунды (0 = без лимита).
+LOOSE_RUN_SECONDS="${IMPORT_LOOSE_RUN_SECONDS:-600}"
+
+build_loose_dir_queue() {
+  # Начинаем с корня; подпапки добавляются по мере обхода (см. process_loose_dir).
+  printf '%s\n' "$IMPORT_ROOT" > "$1"
+}
+
+# Обработка одного loose-файла: хеш, дедуп, загрузка. Счётчики done/skipped/failed
+# берутся из вызывающей process_loose_dir (динамическая область видимости bash).
+process_loose_file() {
+  local file="$1"
+  local hash="" existing captured="" photos_meta=""
+  local csv_meta csv_favorite csv_keywords csv_people http_code file_dir file_base
+  if ! is_video "$file"; then
+    hash_with_heartbeat "$file" "loose files" "$RUN_PROCESSED" 0 0 || {
+      failed=$((failed + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+      log "hash failed/timeout: $(basename "$file")"
+      return 1
+    }
+    hash="$HASH_VALUE"
+  fi
+  existing=""
+  check_hash_existing "$hash" || true
+  existing="$EXISTING_VALUE"
+  if [[ -n "$existing" ]]; then
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
+    photos_meta="$(photos_metadata_for "$file")"
+    if [[ -n "$photos_meta" || -n "$captured" ]]; then
+      send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+    fi
+    skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+    remove_loose_after_success "$file"
+    return 0
+  fi
+  csv_meta="$(csv_metadata_for "$file")"
+  IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+  captured="${captured:-$(capture_date_for "$file")}"
+  photos_meta=""
+  if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
+    photos_meta="$(photos_metadata_for "$file")"
+  fi
+  file_dir="$(dirname "$file")"
+  file_base="$(basename "$file")"
+  if is_video "$file"; then
+    local stream_type="video/mp4"
+    [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+    UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+    [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+    [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+    UPLOAD_ENDPOINT="$STREAM_API"
+    # Битое/зависшее чтение видео не должно блокировать очередь на 15 мин.
+    UPLOAD_TIMEOUT="${IMPORT_VIDEO_UPLOAD_TIMEOUT_SECONDS:-180}"
+  else
+    local -a form_args=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
+    [[ -n "$captured" ]] && form_args+=(--form-string "capturedAt=$captured")
+    [[ -n "$hash" ]] && form_args+=(--form-string "contentHash=$hash")
+    [[ -n "$photos_meta" ]] && form_args+=(--form-string "photosMeta=$photos_meta")
+    UPLOAD_ARGS=("${form_args[@]}")
+    UPLOAD_ENDPOINT="$API"
+    UPLOAD_TIMEOUT="${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}"
+  fi
+  UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"
+  UPLOAD_DONE="$RUN_PROCESSED"; UPLOAD_TOTAL=0; UPLOAD_PENDING=0
+  upload_with_heartbeat || true
+  http_code="$UPLOAD_HTTP_CODE"
+  case "$http_code" in
+    200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
+    413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
+    503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
+    000)
+      if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
+        failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+      else
+        failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
+      fi ;;
+    *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+  esac
+  RUN_PROCESSED=$((RUN_PROCESSED + 1))
+  return 0
+}
+
+process_loose_dir() {
+  local dir="$1" subdirs_out="$2"
+  local entry file deferred fifo hb_pid find_pid find_rc first read_rc stalled
+  local done=0 skipped=0 failed=0
+  deferred="$(mktemp "$IMPORT_STATE_DIR/.deferred.XXXXXX")"
+  fifo="$(mktemp "$IMPORT_STATE_DIR/.fifo.XXXXXX")"
+  rm -f "$fifo"
+  if ! mkfifo "$fifo"; then
+    rm -f "$deferred"
+    log "cannot create fifo for dir scan: $dir"
+    return 1
+  fi
+  : > "$subdirs_out"
+  report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"
+  # Heartbeat, пока листинг не отдал ни одной записи: статус не должен «протухать».
+  ( while sleep 45; do report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"; done ) &
+  hb_pid=$!
+  first=1
+  # Один проход по каталогу; тип записи НЕ запрашиваем у хранилища (-type убран),
+  # файлы обрабатываются по мере поступления, подкаталоги собираются здесь же.
+  find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "$fifo" &
+  find_pid=$!
+  read_rc=0
+  while :; do
+    if IFS= read -r -d '' -t "$LOOSE_DIR_SCAN_TIMEOUT" entry <&3; then
+      if (( first )); then
+        kill "$hb_pid" 2>/dev/null || true
+        wait "$hb_pid" 2>/dev/null || true
+        first=0
+      fi
+      if is_media "$entry"; then
+        if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$entry"; then
+          skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+          continue
+        fi
+        if is_video "$entry"; then
+          # Видео откладываем: фото должны уйти раньше, не делая второй листинг.
+          printf '%s\0' "$entry" >> "$deferred"
+        else
+          report running "loose files" "$RUN_PROCESSED" 0 0 "$(basename "$entry")"
+          process_loose_file "$entry"
+        fi
+      elif [[ -d "$entry" ]]; then
+        # Служебные каталоги (.done, .tmp*) в очередь не ставим — как и прежде
+        # делал collect_subdirs: там лежат уже обработанные файлы и CSV.
+        case "$(basename "$entry")" in
+          .done|.tmp*) ;;
+          *) printf '%s\n' "$entry" >> "$subdirs_out" ;;
+        esac
+      fi
+    else
+      read_rc=$?
+      break
+    fi
+  done 3< "$fifo"
+  if (( first )); then
+    kill "$hb_pid" 2>/dev/null || true
+    wait "$hb_pid" 2>/dev/null || true
+  fi
+  # Сторож простоя: read -t отсчитывается только пока ждём следующую запись.
+  # 1 = EOF (find завершился), >128 = простой (данных не было дольше таймаута).
+  stalled=0
+  if (( read_rc > 128 )); then
+    stalled=1
+    log "dir scan stalled: $dir (no entries for ${LOOSE_DIR_SCAN_TIMEOUT}s)"
+  fi
+  if (( stalled )); then
+    # Мягко, затем принудительно после короткого грейс-периода.
+    kill "$find_pid" 2>/dev/null || true
+    sleep 5
+    kill -9 "$find_pid" 2>/dev/null || true
+  fi
+  if wait "$find_pid"; then find_rc=0; else find_rc=$?; fi
+  rm -f "$fifo"
+  # Отложенные видео — после фото этой папки.
+  if [[ -s "$deferred" ]]; then
+    while IFS= read -r -d '' file; do
+      [[ -e "$file" ]] || continue
+      process_loose_file "$file"
+    done < "$deferred"
+  fi
+  rm -f "$deferred"
+  if (( stalled )) || (( find_rc != 0 )); then
+    # Простой/ошибка листинга: подпапки уже частично собраны, обработанные файлы
+    # не откатываются. Каталог попадёт в счётчик попыток.
+    log "dir scan failed/timeout: $dir (stalled=$stalled find rc=$find_rc)"
+    return 1
+  fi
+  log "dir done $(basename "$dir"): imported=$done skipped=$skipped failed=$failed"
+  return 0
+}
+
+process_loose_import() {
+  # Guard до любых операций под IMPORT_ROOT: на отмонтированной шаре нельзя
+  # создавать .done и служебные файлы — непустая точка монтирования блокирует
+  # восстановление монтирования Supervisor'ом.
+  storage_guard
+  local q="$IMPORT_STATE_DIR/loose-dirs.list"
+  local tries="$IMPORT_STATE_DIR/loose-dir-tries"
+  local sub_tmp
+  # Убираем служебные файлы, которые прежние версии оставили в IMPORT_ROOT.
+  rm -f "$IMPORT_ROOT/.tmp-loose-dirs.list" "$IMPORT_ROOT/.tmp-loose-dir-tries" 2>/dev/null || true
+  mkdir -p "$IMPORT_ROOT/.done"
+  [[ -s "$q" ]] || build_loose_dir_queue "$q"
+
+  # Очередь держим в памяти (O(1) на элемент), подпапки дописываем по ходу.
+  local -a queue=()
+  mapfile -t queue < "$q"
+  local head=0 n=0 start now dir cnt sub d
+  local -A seen=()
+  # Дедуплицируем очередь: прежние версии могли оставить хвост с дублями.
+  if (( ${#queue[@]} > 0 )); then
+    mapfile -t queue < <(printf '%s\n' "${queue[@]}" | sort -u)
+  fi
+  for d in ${queue[@]+"${queue[@]}"}; do
+    [[ -n "$d" ]] && seen["$d"]=1
+  done
+  start="$(date +%s)"
+  sub_tmp="$(mktemp "$IMPORT_STATE_DIR/.subdirs.XXXXXX")"
+
+  while (( head < ${#queue[@]} )); do
+    if (( LOOSE_DIR_BUDGET > 0 )) && (( n >= LOOSE_DIR_BUDGET )); then
+      log "dir budget reached ($LOOSE_DIR_BUDGET); continuing next run"
+      break
+    fi
+    if (( LOOSE_RUN_SECONDS > 0 )); then
+      now="$(date +%s)"
+      if (( now - start >= LOOSE_RUN_SECONDS )); then
+        log "run time budget reached (${LOOSE_RUN_SECONDS}s); continuing next run"
+        break
+      fi
+    fi
+    dir="${queue[$head]}"
+    head=$((head + 1))
+    n=$((n + 1))
+    [[ -d "$dir" ]] || continue
+    local rc=0
+    if process_loose_dir "$dir" "$sub_tmp"; then rc=0; else rc=$?; fi
+    # Подпапки добавляем в очередь независимо от успеха папки: таймаут
+    # листинга не должен отрезать всё поддерево от обхода.
+    if [[ -s "$sub_tmp" ]]; then
+      while IFS= read -r sub; do
+        [[ -n "$sub" ]] || continue
+        if [[ -z "${seen[$sub]:-}" ]]; then
+          seen["$sub"]=1
+          queue+=("$sub")
+        fi
+      done < "$sub_tmp"
+    fi
+    if (( rc == 0 )); then
+      if [[ -f "$tries" ]]; then
+        grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null && mv "$tries.tmp" "$tries" || rm -f "$tries.tmp"
+      fi
+    else
+      cnt=0
+      if [[ -f "$tries" ]]; then
+        cnt="$(awk -F'\t' -v d="$dir" '$1==d{print $2}' "$tries" 2>/dev/null | tail -1 || true)"
+      fi
+      cnt=$(( ${cnt:-0} + 1 ))
+      if [[ -f "$tries" ]]; then
+        grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null || true
+      fi
+      printf '%s\t%s\n' "$dir" "$cnt" >> "$tries.tmp"
+      mv "$tries.tmp" "$tries" 2>/dev/null || true
+      if (( cnt <= 3 )); then
+        queue+=("$dir")
+      else
+        log "dir skipped after $cnt failures: $dir"
+      fi
+    fi
+  done
+  rm -f "$sub_tmp"
+
+  # Сохраняем необработанный хвост очереди для следующего прогона.
+  : > "$q"
+  if (( head < ${#queue[@]} )); then
+    printf '%s\n' "${queue[@]:head}" | sort -u >> "$q"
+  else
+    log "loose walk complete: no directories left"
+    report idle "waiting for Apple media" 0 0 0
+    prune_empty_import_dirs
+  fi
+  local pending
+  pending="$(wc -l < "$q" 2>/dev/null || echo 0)"
+  log "loose batch done: dirs=$n pending=$pending"
+  return 0
+}
+
+has_pending_loose_media() {
+  local file
+  while IFS= read -r -d '' file; do
+    if is_media "$file"; then return 0; fi
+  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f -print0 2>/dev/null)
+  return 1
+}
+
+process_archive() {
+  local archive="$1" work_dir done=0 skipped=0 failed=0
+  work_dir="$(mktemp -d "$IMPORT_ROOT/.tmp.XXXXXX")"
+  log "unpacking $(basename "$archive")"
+  if ! unzip -q -o "$archive" -d "$work_dir"; then
+    rm -rf "$work_dir"
+    fail unpack "$(basename "$archive")"
+  fi
+
+  # Собираем список медиафайлов
+  local list="$work_dir/.files.list"
+  CSV_META_FILE="$work_dir/.csv-meta.tsv"
+  build_csv_metadata "$work_dir" "$CSV_META_FILE"
+  find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
+  prioritize_media_list "$list"
+  # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
+  local total=0 f
+  while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
+  # -1: текущий архив уже в работе, не считаем его в «осталось»
+  local pending=$(( $(count_pending_archives) - 1 ))
+  report running "$(basename "$archive")" 0 "$total" "$pending"
+
+  local file hash existing captured
+  while IFS= read -r -d '' file; do
+    is_media "$file" || continue
+    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
+    hash=""
+    if ! is_video "$file"; then
+      hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
+        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; note_storage_failure; continue
+      }
+      hash="$HASH_VALUE"
+    else
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "uploading $(basename "$file")"
+    fi
+    # Дедуп против БД
+    check_hash_existing "$hash" || true
+    existing="$EXISTING_VALUE"
+    if [[ -n "$existing" ]]; then
+      local csv_meta csv_favorite csv_keywords csv_people
+      csv_meta="$(csv_metadata_for "$file")"
+      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+      captured="${captured:-$(capture_date_for "$file")}"
+      photos_meta="$(photos_metadata_for "$file")"
+      if [[ -n "$photos_meta" || -n "$captured" ]]; then
+        send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+      fi
+      skipped=$((skipped + 1))
+      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
+      continue
+    fi
+    local csv_meta csv_favorite csv_keywords csv_people photos_meta
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
+    # Загрузка
+    local http_code file_size file_dir file_base
+    file_size="$(stat -c%s "$file" 2>/dev/null || printf '?')"
+    log "uploading $(basename "$file") size=${file_size} bytes"
+    file_dir="$(dirname "$file")"
+    file_base="$(basename "$file")"
+    local -a archive_form=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
+    [[ -n "$captured" ]] && archive_form+=(--form-string "capturedAt=$captured")
+    photos_meta="$(photos_metadata_for "$file")"
+    [[ -n "$photos_meta" ]] && archive_form+=(--form-string "photosMeta=$photos_meta")
+    [[ -n "$hash" ]] && archive_form+=(--form-string "contentHash=$hash")
+    if is_video "$file"; then
+      local stream_type="video/mp4"
+      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+      UPLOAD_ENDPOINT="$STREAM_API"
+    else
+      UPLOAD_ARGS=("${archive_form[@]}")
+      UPLOAD_ENDPOINT="$API"
+    fi
+    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"
+    upload_with_heartbeat || true
+    http_code="$UPLOAD_HTTP_CODE"
+    case "$http_code" in
+      200|201) done=$((done + 1)); reset_storage_failures ;;
+      413) skipped=$((skipped + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
+      503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
+      000)
+        if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
+          failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+        else
+          failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
+        fi ;;
+      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+    esac
+    update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
+    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
+  done < "$list"
+
+  rm -rf "$work_dir"
+  CSV_META_FILE=""
+  mkdir -p "$IMPORT_ROOT/.done"
+  # Сохраняем относительный путь подпапки, чтобы одинаковые имена архивов не конфликтовали.
+  local rel_path done_path done_dir
+  rel_path="${archive#"$IMPORT_ROOT"/}"
+  done_path="$IMPORT_ROOT/.done/$rel_path"
+  done_dir="$(dirname "$done_path")"
+  mkdir -p "$done_dir"
+  if [[ "$failed" -eq 0 ]]; then
+    rm -f -- "$archive"
+  fi
+  log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
+  update_state "$rel_path" "$done" "$skipped" "$failed"
+  if [[ "$failed" -gt 0 ]]; then
+    report error "$rel_path" $((done + skipped + failed)) "$total" "$pending" "failed=$failed"
+    return 1
+  fi
+  report completed "$rel_path" $((done + skipped)) "$total" "$pending"
+  purge_done
+}
+
+# Guard вместо прежнего безусловного write-test: проверка монтирования + проба
+# чтения/записи под таймаутом. Выполняется до любых mkdir под IMPORT_ROOT
+# (включая .done ниже) и до веток --metadata-backfill / архивов / loose.
+storage_guard
+
+mkdir -p "$IMPORT_ROOT/.done"
+if [[ "${1:-}" == "--metadata-backfill" ]]; then
+  metadata_backfill
+  exit 0
+fi
+# Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
+mapfile -t archives < <(timeout 120 find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
+if (( ${#archives[@]} > 0 )); then
+  # Новые архивы имеют приоритет над большой очередью уже распакованных файлов.
+  process_archive "${archives[0]}"
+  prune_empty_import_dirs
+  exit 0
+fi
+
+process_loose_import

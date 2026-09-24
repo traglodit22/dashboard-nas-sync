@@ -10,4 +10,5 @@ RUN chmod 755 /etc/services.d/archive-sync/run \
   /etc/services.d/archive-sync-import/run \
   /usr/local/bin/archive-sync \
   /usr/local/bin/archive-sync-api \
-  /usr/local/bin/archive-import
+  /usr/local/bin/archive-import \
+  /usr/local/bin/archive-import-legacy

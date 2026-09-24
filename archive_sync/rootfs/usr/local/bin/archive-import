@@ -1,389 +1,473 @@
-#!/usr/bin/env bash
-# Импорт Apple-архивов (zip) в галерею дашборда.
-# Берёт первый .zip из $IMPORT_ROOT, распаковывает, загружает медиа через API,
-# помечает архив обработанным. Даты: EXIF → JSON-спутник Apple → имя файла.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Импорт медиа из папки на NAS в галерею дашборда переносом файла на месте.
 
-: "${DASHBOARD_URL:?service URL is required}"
-: "${NAS_SYNC_TOKEN:?access token is required}"
-: "${IMPORT_ROOT:=/share/NAS/apple-import}"
-: "${IMPORT_PARALLEL:=2}"
-: "${IMPORT_STATE_FILE:=/data/import-state.json}"
-: "${IMPORT_DONE_RETENTION_DAYS:=30}"
-IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS="${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS:-30}"
-IMPORT_STORAGE_FAIL_LIMIT="${IMPORT_STORAGE_FAIL_LIMIT:-3}"
-: "${NAS_MOUNT_BASE:=/share}"
-: "${MOUNT_CHECK_ENABLED:=true}"
-META_STATE_FILE="${IMPORT_STATE_FILE}.metadata"
+Один потоковый проход по IMPORT_ROOT (os.scandir, без предварительных списков и
+полного сканирования): каждый файл хешируется, дашборд выдаёт ему fileId и путь
+в галерее (reserve), файл переносится rename внутри NAS и регистрируется
+(commit). Байты фото через интернет не идут. Обработанные файлы уходят из папки
+импорта, поэтому каждый следующий проход короче.
 
-# Служебные файлы (очередь обхода, временные результаты) держим в записываемом
-# каталоге состояния (/data), а не в IMPORT_ROOT: сетевой шар может разрешать
-# создание файлов, но не перезапись старых служебных файлов.
-IMPORT_STATE_DIR="${IMPORT_STATE_DIR:-$(dirname "$IMPORT_STATE_FILE")}"
-mkdir -p "$IMPORT_STATE_DIR"
+Шаги каждого файла пишутся в журнал /data/import-journal: после сбоя
+незавершённые переносы доводятся или откатываются.
 
-API="${DASHBOARD_URL%/}/api/sync/nas/import"
-STREAM_API="${DASHBOARD_URL%/}/api/sync/nas/import/stream"
-CHECK_API="${DASHBOARD_URL%/}/api/sync/nas/import/check-hashes"
-META_API="${DASHBOARD_URL%/}/api/sync/nas/import/metadata"
-STATUS_API="${DASHBOARD_URL%/}/api/sync/nas/import/status"
-AUTH=(-H "Authorization: Bearer $NAS_SYNC_TOKEN" -H "X-NAS-Agent-Id: archive-import")
+Коды выхода: 0 — проход завершён, 3 — исчерпан бюджет времени (продолжить
+сразу), 4 — работы не было (можно ждать дольше), 1 — ошибка/хранилище недоступно.
+--metadata-backfill выполняется прежним скриптом archive-import-legacy.
+"""
+from __future__ import annotations
 
-log() { printf '[import] %s\n' "$*" >&2; }
-fail() { printf '[import] FAILED at %s: %s\n' "$1" "$2" >&2; exit 1; }
-
-update_state() {
-  printf '{"archive":"%s","done":%s,"skipped":%s,"failed":%s,"updatedAt":"%s"}\n' \
-    "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)" > "$IMPORT_STATE_FILE.tmp" 2>/dev/null \
-    && mv -f "$IMPORT_STATE_FILE.tmp" "$IMPORT_STATE_FILE" 2>/dev/null || true
-}
-
-# Репорт прогресса в дашборд (виджет Облака). Не падаем при ошибке сети.
-# archives_left — сколько zip ещё ждёт в папке (без текущего).
-report() {
-  local status="$1" archive="$2" done="$3" total="$4" archives_left="${5:-0}" file="${6:-}"
-  local label="$archive"
-  [[ -n "$file" ]] && label="$label :: $file"
-  curl -sf --connect-timeout 5 --max-time 10 "${AUTH[@]}" \
-    "${STATUS_API}?status=$(printf '%s' "$status" | jq -sRr @uri)&archive=$(printf '%s' "$label" | jq -sRr @uri)&done=$done&total=$total&archivesLeft=$archives_left" \
-    >/dev/null 2>&1 || true
-}
-
-# --- Проверка реального монтирования и доступности хранилища -----------------
-# Сравниваем st_dev пути с st_dev базы NAS_MOUNT_BASE (по умолчанию /share), а не
-# с ближайшим родителем: IMPORT_ROOT вложен внутрь монтирования (/share/NAS/...),
-# и родитель имеет тот же st_dev. Если путь не существует — поднимаемся до
-# ближайшего существующего предка.
-# Результат: 0 = mounted, 1 = not mounted, 2 = undefined (базы нет, stat
-# недоступен, путь вне базы). Неопределённый результат — «разрешить» с warning.
-MOUNT_CHECK_PATH_DEV=""
-MOUNT_CHECK_BASE_DEV=""
-path_is_mounted() {
-  local p="$1" base="${NAS_MOUNT_BASE:-/share}" probe p_dev base_dev
-  MOUNT_CHECK_PATH_DEV=""
-  MOUNT_CHECK_BASE_DEV=""
-  if [[ "$MOUNT_CHECK_ENABLED" != "true" ]]; then
-    return 0
-  fi
-  if [[ ! -d "$base" ]]; then
-    return 2
-  fi
-  base="${base%/}"
-  case "$p" in
-    "$base"|"$base"/*) ;;
-    *) return 2 ;;
-  esac
-  probe="$p"
-  while [[ ! -e "$probe" ]]; do
-    probe="$(dirname "$probe")"
-    if [[ "$probe" == "/" ]]; then
-      break
-    fi
-  done
-  if [[ ! -d "$probe" ]]; then
-    return 2
-  fi
-  p_dev="$(stat -c '%d' "$probe" 2>/dev/null)" || return 2
-  base_dev="$(stat -c '%d' "$base" 2>/dev/null)" || return 2
-  MOUNT_CHECK_PATH_DEV="$p_dev"
-  MOUNT_CHECK_BASE_DEV="$base_dev"
-  if [[ "$p_dev" == "$base_dev" ]]; then
-    return 1
-  fi
-  return 0
-}
-
-# Проба доступности: чтение каталога + создание/удаление служебного файла
-# с фиксированным именем .import-probe в IMPORT_ROOT, под таймаутом.
-storage_probe() {
-  local root="$1"
-  timeout -k 5 "$IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS" bash -c '
-    root="$1"
-    ls -1 "$root" >/dev/null 2>&1 || exit 1
-    if ! touch "$root/.import-probe" 2>/dev/null; then
-      rm -f "$root/.import-probe" 2>/dev/null || true
-      exit 1
-    fi
-    rm -f "$root/.import-probe" 2>/dev/null || exit 1
-    exit 0
-  ' storage-probe "$root"
-}
-
-# Предохранитель по серии подряд идущих отказов хранилища.
-STORAGE_FAIL_STREAK=0
-reset_storage_failures() { STORAGE_FAIL_STREAK=0; }
-note_storage_failure() {
-  STORAGE_FAIL_STREAK=$((STORAGE_FAIL_STREAK + 1))
-  if (( STORAGE_FAIL_STREAK >= IMPORT_STORAGE_FAIL_LIMIT )); then
-    log "storage failure streak: $STORAGE_FAIL_STREAK (limit $IMPORT_STORAGE_FAIL_LIMIT); aborting run"
-    report error "хранилище недоступно" 0 0 0
-    exit 1
-  fi
-}
-
-# Guard перед началом прохода: ничего не создаём под IMPORT_ROOT до его успеха.
-storage_guard() {
-  local rc=0
-  path_is_mounted "$IMPORT_ROOT" || rc=$?
-  case "$rc" in
-    0) ;;
-    1)
-      log "storage unavailable: $IMPORT_ROOT is not a real mount (path st_dev=${MOUNT_CHECK_PATH_DEV:-?}, base ${NAS_MOUNT_BASE:-/share} st_dev=${MOUNT_CHECK_BASE_DEV:-?})"
-      report error "хранилище недоступно" 0 0 0
-      exit 1
-      ;;
-    *)
-      log "warning: cannot determine mount state for $IMPORT_ROOT; continuing"
-      ;;
-  esac
-  if ! storage_probe "$IMPORT_ROOT"; then
-    log "storage unavailable: probe failed for $IMPORT_ROOT (read/create/delete test, timeout ${IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS}s)"
-    report error "хранилище недоступно" 0 0 0
-    exit 1
-  fi
-  reset_storage_failures
-}
-
-# Дедуп против БД через check-hashes. Заполняет EXISTING_VALUE и CHECK_HTTP_CODE.
-# 2xx → успех (сбрасывает серию отказов); non-2xx/000 → отказ хранилища.
-CHECK_HTTP_CODE="000"
-EXISTING_VALUE=""
-check_hash_existing() {
-  local hash="$1" body code_file
-  EXISTING_VALUE=""
-  CHECK_HTTP_CODE="000"
-  [[ -n "$hash" ]] || return 0
-  body="$(mktemp "$IMPORT_STATE_DIR/.check-hashes.XXXXXX")"
-  code_file="$(mktemp "$IMPORT_STATE_DIR/.check-hashes-code.XXXXXX")"
-  curl -sS -o "$body" -w '%{http_code}' --retry 3 --retry-delay 2 --retry-all-errors -m 30 \
-    "${AUTH[@]}" -H 'Content-Type: application/json' \
-    --data-binary "{\"hashes\":[\"$hash\"]}" "$CHECK_API" > "$code_file" 2>/dev/null || true
-  CHECK_HTTP_CODE="$(tail -c 3 "$code_file" 2>/dev/null || true)"
-  [[ "$CHECK_HTTP_CODE" =~ ^[0-9]{3}$ ]] || CHECK_HTTP_CODE="000"
-  rm -f "$code_file"
-  case "$CHECK_HTTP_CODE" in
-    2*)
-      reset_storage_failures
-      EXISTING_VALUE="$(jq -r --arg h "$hash" '.existing[$h] // empty' "$body" 2>/dev/null || true)"
-      rm -f "$body"
-      return 0
-      ;;
-    *)
-      rm -f "$body"
-      log "check-hashes failed (HTTP $CHECK_HTTP_CODE)"
-      note_storage_failure
-      return 1
-      ;;
-  esac
-}
-
-HASH_VALUE=""
-
-# Файлов, обработанных за текущий прогон loose-обхода (для статуса без total).
-RUN_PROCESSED=0
-
-heartbeat() {
-  local label="$1" done="$2" total="$3" pending="$4" stage="$5"
-  while sleep 30; do
-    report running "$label" "$done" "$total" "$pending" "$stage"
-  done
-}
-
-hash_with_heartbeat() {
-  local file="$1" label="$2" done="$3" total="$4" pending="$5"
-  local result_file heartbeat_pid rc
-  result_file="$(mktemp "$IMPORT_STATE_DIR/.hash-result.XXXXXX")"
-  report running "$label" "$done" "$total" "$pending" "hashing $(basename "$file")"
-  heartbeat "$label" "$done" "$total" "$pending" "hashing $(basename "$file")" &
-  heartbeat_pid=$!
-  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then rc=0; else rc=$?; fi
-  kill "$heartbeat_pid" 2>/dev/null || true
-  wait "$heartbeat_pid" 2>/dev/null || true
-  HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
-  rm -f "$result_file"
-  [[ "$rc" -eq 0 && "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
-}
-
-UPLOAD_HTTP_CODE="000"
-UPLOAD_CURL_RC=0
-UPLOAD_DIR=""
-UPLOAD_LABEL=""
-UPLOAD_DONE=0
-UPLOAD_TOTAL=0
-UPLOAD_PENDING=0
-UPLOAD_FILE_NAME=""
-UPLOAD_ARGS=()
-UPLOAD_ENDPOINT="$API"
-
-upload_with_heartbeat() {
-  local result_file heartbeat_pid rc
-  result_file="$(mktemp "$IMPORT_STATE_DIR/.upload-status.XXXXXX")"
-  report running "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME"
-  heartbeat "$UPLOAD_LABEL" "$UPLOAD_DONE" "$UPLOAD_TOTAL" "$UPLOAD_PENDING" "uploading $UPLOAD_FILE_NAME" &
-  heartbeat_pid=$!
-  if (
-    cd "$UPLOAD_DIR" || exit 1
-    curl -sS -o /dev/null -w '%{http_code}' \
-      --retry 3 --retry-delay 2 --retry-all-errors \
-      --connect-timeout 30 -m "${UPLOAD_TIMEOUT:-${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}}" \
-      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
-  ); then rc=0; else rc=$?; fi
-  kill "$heartbeat_pid" 2>/dev/null || true
-  wait "$heartbeat_pid" 2>/dev/null || true
-  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
-  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
-  UPLOAD_CURL_RC="$rc"
-  rm -f "$result_file"
-  return "$rc"
-}
-
-# Хеш без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
-hash_value_of() {
-  local file="$1" result_file
-  result_file="$(mktemp)"
-  HASH_VALUE=""
-  if timeout -k 5 300 sha256sum "$file" > "$result_file"; then
-    HASH_VALUE="$(cut -d' ' -f1 "$result_file" 2>/dev/null || true)"
-  fi
-  rm -f "$result_file"
-  [[ "$HASH_VALUE" =~ ^[a-f0-9]{64}$ ]]
-}
-
-# Аплоад без heartbeat — прогресс в параллельном режиме шлёт агрегатор.
-upload_quiet() {
-  local result_file rc
-  result_file="$(mktemp)"
-  if (
-    cd "$UPLOAD_DIR" || exit 1
-    curl -sS -o /dev/null -w '%{http_code}' \
-      --retry 3 --retry-delay 2 --retry-all-errors \
-      --connect-timeout 30 -m "${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}" \
-      "${AUTH[@]}" "${UPLOAD_ARGS[@]}" "$UPLOAD_ENDPOINT" > "$result_file"
-  ); then rc=0; else rc=$?; fi
-  UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
-  [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
-  UPLOAD_CURL_RC="$rc"
-  rm -f "$result_file"
-  return "$rc"
-}
-
-# Сколько zip-архивов осталось (рекурсивно, включая подпапки).
-count_pending_archives() {
-  find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | wc -l
-}
-
-# Дата съёмки: EXIF → JSON-спутник → имя файла. Печатает ISO 8601 или пусто.
-capture_date_for() {
-  local file="$1" base dt
-  # Photo Details*.csv is the most reliable source for exported videos, which
-  # usually have no readable EXIF metadata.
-  if [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]]; then
-    local csv_name csv_date
-    while IFS=$'\t' read -r csv_name csv_date _; do
-      if [[ "$csv_name" == "$(basename "$file")" ]]; then
-        printf '%s' "$csv_date"
-        return 0
-      fi
-    done < "$CSV_META_FILE"
-  fi
-  # EXIF (exiftool): DateTimeOriginal / CreateDate
-  dt="$(timeout -k 5 30 exiftool -s3 -d '%Y-%m-%dT%H:%M:%S' -DateTimeOriginal -CreateDate "$file" 2>/dev/null | head -1 || true)"
-  if [[ -n "$dt" ]]; then printf '%s' "$dt"; return 0; fi
-  # JSON-спутник Apple Takeout: <name>.json рядом
-  base="${file%.*}"
-  for json in "$file.json" "$base.json"; do
-    if [[ -f "$json" ]]; then
-      dt="$(jq -r '.photoTakenTime.formatted // .creationTime.formatted // empty' "$json" 2>/dev/null || true)"
-      if [[ -n "$dt" ]]; then
-        # "11 февр. 2026 г., 14:19:14 UTC" → не парсим; берём timestamp если есть
-        local ts
-        ts="$(jq -r '.photoTakenTime.timestamp // .creationTime.timestamp // empty' "$json" 2>/dev/null || true)"
-        if [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]]; then
-          printf '%s' "$(date -u -d "@$ts" +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)"
-          return 0
-        fi
-      fi
-    fi
-  done
-  # Имя файла: IMG_20260211_141914, 2026-02-11 14.19.14, 20260211_141914
-  local name re
-  name="$(basename "$file")"
-  re='(20[0-9]{2})[-_]?([01][0-9])[-_]?([0-3][0-9])[-_ ]?([0-2][0-9])[-.:]?([0-5][0-9])[-.:]?([0-5][0-9])?'
-  if [[ "$name" =~ $re ]]; then
-    printf '%s-%s-%sT%s:%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
-      "${BASH_REMATCH[4]:-00}" "${BASH_REMATCH[5]:-00}" "${BASH_REMATCH[6]:-00}"
-    return 0
-  fi
-  printf ''
-}
-
-is_media() {
-  local f
-  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$f" in
-    *.jpg|*.jpeg|*.png|*.heic|*.heif|*.gif|*.webp|*.tiff|*.tif|*.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_video() {
-  local f
-  f="$(basename "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$f" in
-    *.mov|*.mp4|*.m4v|*.3gp) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-prioritize_media_list() {
-  local list="$1"
-  python3 - "$list" <<'PY'
-import os
-import sys
-
-path = sys.argv[1]
-with open(path, 'rb') as handle:
-    files = [item for item in handle.read().split(b'\0') if item]
-video = {b'.mov', b'.mp4', b'.m4v', b'.3gp'}
-files.sort(key=lambda item: (os.path.splitext(item.lower())[1] in video, item.lower()))
-with open(path, 'wb') as handle:
-    for item in files:
-        handle.write(item + b'\0')
-PY
-}
-
-# Экранирование имени файла для curl -F "file=@\"...\"": внутри кавычек curl
-# понимает \\ и \", а , ; и ведущий @ становятся литеральными.
-curl_form_filename() {
-  local name="$1"
-  name="${name//\\/\\\\}"
-  name="${name//\"/\\\"}"
-  printf '%s' "$name"
-}
-
-build_csv_metadata() {
-  local source_root="$1" output="$2"
-  # Apple/Photos exports differ in column names. Keep only rows that have a
-  # filename and a machine-readable capture date; other CSV columns remain
-  # available in .done for manual inspection.
-  python3 - "$source_root" "$output" <<'PY'
+import concurrent.futures
 import csv
 import datetime as dt
+import errno
+import hashlib
+import json
 import os
+import queue
 import re
+import select
+import shutil
+import signal
+import subprocess
 import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 
-root, output = sys.argv[1:]
-name_words = ('filename', 'file name', 'original filename', 'original name', 'media name')
-date_words = ('date', 'capture date', 'date taken', 'creation date', 'created date', 'time')
-favorite_words = ('favorite', 'is favorite', 'favourite')
-keyword_words = ('keywords', 'keyword', 'tags', 'tag')
-people_words = ('people', 'person', 'faces', 'face names')
+EXIT_OK, EXIT_FAIL, EXIT_MORE, EXIT_IDLE = 0, 1, 3, 4
 
-def normalize(value):
-    return re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
+PHOTO_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp", ".tiff", ".tif"}
+VIDEO_EXT = {".mov", ".mp4", ".m4v", ".3gp"}
+MEDIA_EXT = PHOTO_EXT | VIDEO_EXT
+HASH_CHUNK = 1024 * 1024
 
-def parse_date(value):
+
+def env_str(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on")
+
+
+DASHBOARD_URL = env_str("DASHBOARD_URL", "").rstrip("/")
+TOKEN = os.environ.get("NAS_SYNC_TOKEN", "").strip()
+IMPORT_ROOT = os.path.realpath(env_str("IMPORT_ROOT", "/share/NAS/apple-import"))
+FILES_ROOT = os.path.realpath(env_str("FILES_ROOT", "/share/NAS"))
+STATE_DIR = env_str("IMPORT_STATE_DIR", os.path.dirname(env_str("IMPORT_STATE_FILE", "/data/import-state.json")))
+PARALLEL = min(env_int("IMPORT_PARALLEL", 4), 8)
+SKIP_VIDEOS = env_bool("IMPORT_SKIP_VIDEOS", False)
+MOUNT_CHECK = env_bool("MOUNT_CHECK_ENABLED", True)
+MOUNT_BASE = env_str("NAS_MOUNT_BASE", "/share")
+PROBE_TIMEOUT = env_int("IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS", 30)
+FAIL_LIMIT = env_int("IMPORT_STORAGE_FAIL_LIMIT", 3)
+DIR_TIMEOUT = env_int("IMPORT_DIR_SCAN_TIMEOUT", 180)
+RUN_SECONDS = env_int("IMPORT_RUN_SECONDS", env_int("IMPORT_LOOSE_RUN_SECONDS", 1800))
+REPORT_EVERY = env_int("IMPORT_REPORT_SECONDS", 15)
+
+JOURNAL_DIR = os.path.join(STATE_DIR, "import-journal")
+WALK_FILE = os.path.join(STATE_DIR, "import-walk.json")
+FAILED_FILE = os.path.join(STATE_DIR, "import-failed.json")
+SUMMARY_FILE = os.path.join(STATE_DIR, "import-state.json")
+
+STOP = threading.Event()
+
+
+def log(message: str) -> None:
+    print(f"[import] {message}", file=sys.stderr, flush=True)
+
+
+class StorageDown(Exception):
+    """Серия отказов хранилища/дашборда — прекращаем прогон."""
+
+
+class Fatal(Exception):
+    """Ошибка конфигурации (например, неверный токен)."""
+
+
+# --- Состояние на локальном диске (/data) -----------------------------------
+
+def write_json_atomic(path: str, data: object) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+class Journal:
+    """Незавершённые шаги по fileId: reserved → moved → (commit) → удалено."""
+
+    def __init__(self, directory: str) -> None:
+        self.dir = directory
+        os.makedirs(directory, exist_ok=True)
+
+    def _path(self, file_id: str) -> str:
+        return os.path.join(self.dir, f"{file_id}.json")
+
+    def write(self, file_id: str, record: dict) -> None:
+        write_json_atomic(self._path(file_id), record)
+
+    def remove(self, file_id: str) -> None:
+        try:
+            os.remove(self._path(file_id))
+        except FileNotFoundError:
+            pass
+
+    def items(self):
+        for name in sorted(os.listdir(self.dir)):
+            if name.endswith(".json"):
+                record = read_json(os.path.join(self.dir, name), None)
+                if isinstance(record, dict):
+                    yield name[:-5], record
+
+
+class FailedMemory:
+    """Файлы, которые не удалось импортировать: повтор с растущей паузой, а не каждый проход."""
+
+    LIMIT = 50000
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        data = read_json(path, {})
+        self.items: dict = data if isinstance(data, dict) else {}
+
+    def should_skip(self, key: str) -> bool:
+        with self.lock:
+            item = self.items.get(key)
+            return bool(item) and item.get("next", 0) > time.time()
+
+    def note(self, key: str) -> None:
+        with self.lock:
+            count = int(self.items.get(key, {}).get("n", 0)) + 1
+            self.items[key] = {"n": count, "next": time.time() + min(600 * 2 ** (count - 1), 86400)}
+
+    def clear(self, key: str) -> None:
+        with self.lock:
+            self.items.pop(key, None)
+
+    def save(self) -> None:
+        with self.lock:
+            if len(self.items) > self.LIMIT:
+                ordered = sorted(self.items.items(), key=lambda kv: kv[1].get("next", 0))
+                self.items = dict(ordered[-self.LIMIT:])
+            write_json_atomic(self.path, self.items)
+
+
+class Health:
+    """Серия подряд идущих отказов хранилища или дашборда."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.streak = 0
+        self.lock = threading.Lock()
+
+    def ok(self) -> None:
+        with self.lock:
+            self.streak = 0
+
+    def fail(self, reason: str) -> None:
+        with self.lock:
+            self.streak += 1
+            streak = self.streak
+        log(f"storage/service failure ({streak}/{self.limit}): {reason}")
+        if streak >= self.limit:
+            STOP.set()
+            raise StorageDown(reason)
+
+
+class Stats:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.counts = {"imported": 0, "duplicate": 0, "failed": 0, "skipped": 0, "busy": 0}
+        self.started = time.time()
+        self.where = "старт"
+
+    def add(self, outcome: str) -> None:
+        with self.lock:
+            self.counts[outcome] = self.counts.get(outcome, 0) + 1
+
+    @property
+    def done(self) -> int:
+        with self.lock:
+            return self.counts["imported"] + self.counts["duplicate"]
+
+    def rate_per_min(self) -> float:
+        elapsed = max(time.time() - self.started, 1.0)
+        return self.done * 60.0 / elapsed
+
+    def summary(self) -> str:
+        with self.lock:
+            return " ".join(f"{k}={v}" for k, v in self.counts.items())
+
+
+# --- Дашборд ----------------------------------------------------------------
+
+class Api:
+    def __init__(self, base: str, token: str) -> None:
+        self.base = base
+        self.headers = {"Authorization": f"Bearer {token}", "X-NAS-Agent-Id": "archive-import"}
+
+    def request(self, method: str, path: str, body: dict | None = None, timeout: int = 60, retries: int = 3):
+        """→ (http_status, json|None); 0 — сеть/таймаут."""
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = dict(self.headers)
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        status, payload = 0, None
+        for attempt in range(retries):
+            req = urllib.request.Request(f"{self.base}{path}", data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status, raw = resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                status, raw = exc.code, exc.read()
+            except (urllib.error.URLError, OSError):
+                status, raw = 0, b""
+            try:
+                payload = json.loads(raw) if raw else None
+            except ValueError:
+                payload = None
+            if status not in (0, 502, 504):
+                break
+            time.sleep(2 * (attempt + 1))
+        return status, payload
+
+    def register(self, body: dict):
+        return self.request("POST", "/api/sync/nas/import/register", body)
+
+    def report(self, status: str, label: str, done: int, total: int = 0, left: int = 0) -> None:
+        query = urllib.parse.urlencode(
+            {"status": status, "archive": label, "done": done, "total": total, "archivesLeft": left}
+        )
+        self.request("GET", f"/api/sync/nas/import/status?{query}", timeout=10, retries=1)
+
+
+# --- Хранилище --------------------------------------------------------------
+
+def run_with_timeout(func, timeout: int):
+    """Вызов в отдельном потоке: зависший syscall на сетевом шаре не вешает импорт."""
+    result: dict = {}
+
+    def target() -> None:
+        try:
+            result["value"] = func()
+        except Exception as exc:  # noqa: BLE001 — передаём наружу как результат
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"timeout after {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def mount_state(path: str) -> str:
+    """mounted | not_mounted | unknown (как path_is_mounted прежнего скрипта)."""
+    if not MOUNT_CHECK:
+        return "mounted"
+    base = MOUNT_BASE.rstrip("/") or "/"
+    if not os.path.isdir(base) or not (path == base or path.startswith(base + "/")):
+        return "unknown"
+    probe = path
+    while not os.path.exists(probe) and probe != "/":
+        probe = os.path.dirname(probe)
+    try:
+        return "not_mounted" if os.stat(probe).st_dev == os.stat(base).st_dev else "mounted"
+    except OSError:
+        return "unknown"
+
+
+def storage_guard(api: Api) -> None:
+    state = mount_state(IMPORT_ROOT)
+    if state == "not_mounted":
+        log(f"storage unavailable: {IMPORT_ROOT} is not a real mount")
+        api.report("error", "хранилище недоступно", 0)
+        raise StorageDown("not mounted")
+    if state == "unknown":
+        log(f"warning: cannot determine mount state for {IMPORT_ROOT}; continuing")
+
+    def probe() -> None:
+        os.listdir(IMPORT_ROOT)
+        marker = os.path.join(IMPORT_ROOT, ".import-probe")
+        with open(marker, "w", encoding="utf-8"):
+            pass
+        os.remove(marker)
+
+    try:
+        run_with_timeout(probe, PROBE_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        log(f"storage unavailable: probe failed for {IMPORT_ROOT}: {exc}")
+        api.report("error", "хранилище недоступно", 0)
+        raise StorageDown("probe failed") from exc
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(HASH_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_join(root: str, rel: str) -> str | None:
+    target = os.path.realpath(os.path.join(root, rel))
+    return target if target.startswith(root.rstrip("/") + "/") else None
+
+
+def move_into_gallery(src: str, dst: str, content_hash: str) -> None:
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    # Другое устройство: копия во временный файл, сверка, затем замена.
+    part = f"{dst}.part"
+    shutil.copyfile(src, part)
+    if os.path.getsize(part) != os.path.getsize(src) or sha256_file(part) != content_hash:
+        os.remove(part)
+        raise OSError(f"copy verification failed: {dst}")
+    os.replace(part, dst)
+    os.remove(src)
+
+
+def move_back(src: str, dst: str) -> bool:
+    """Вернуть файл в папку импорта (регистрация не удалась)."""
+    if not os.path.exists(dst) or os.path.exists(src):
+        return False
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    os.rename(dst, src)
+    return True
+
+
+# --- Метаданные -------------------------------------------------------------
+
+class ExifTool:
+    """Один процесс exiftool -stay_open на весь прогон вместо запуска на каждый файл."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.available = shutil.which("exiftool") is not None
+
+    def _start(self) -> None:
+        self.proc = subprocess.Popen(
+            ["exiftool", "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _kill(self) -> None:
+        if self.proc:
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = None
+
+    def capture_date(self, path: str, timeout: int = 30) -> str | None:
+        if not self.available or "\n" in path:
+            return None
+        with self.lock:
+            try:
+                if self.proc is None or self.proc.poll() is not None:
+                    self._start()
+                args = ["-s3", "-d", "%Y-%m-%dT%H:%M:%S", "-DateTimeOriginal", "-CreateDate", path, "-execute"]
+                assert self.proc and self.proc.stdin and self.proc.stdout
+                self.proc.stdin.write(("\n".join(args) + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+                fd = self.proc.stdout.fileno()
+                out = b""
+                deadline = time.time() + timeout
+                while b"{ready}" not in out:
+                    remaining = deadline - time.time()
+                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                        self._kill()
+                        return None
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        self._kill()
+                        return None
+                    out += chunk
+            except (OSError, ValueError):
+                self._kill()
+                return None
+        for line in out.split(b"{ready}")[0].decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", line) and not line.startswith("0000"):
+                return line
+        return None
+
+    def close(self) -> None:
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                try:
+                    assert self.proc.stdin
+                    self.proc.stdin.write(b"-stay_open\nFalse\n")
+                    self.proc.stdin.flush()
+                    self.proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    self._kill()
+            self.proc = None
+
+
+FILENAME_DATE = re.compile(
+    r"(20[0-9]{2})[-_]?([01][0-9])[-_]?([0-3][0-9])[-_ ]?([0-2][0-9])[-.:]?([0-5][0-9])[-.:]?([0-5][0-9])?"
+)
+
+
+def sidecar_date(path: str) -> str | None:
+    stem = os.path.splitext(path)[0]
+    for candidate in (f"{path}.json", f"{stem}.json"):
+        data = read_json(candidate, None)
+        if not isinstance(data, dict):
+            continue
+        for key in ("photoTakenTime", "creationTime"):
+            ts = (data.get(key) or {}).get("timestamp")
+            if isinstance(ts, (str, int)) and str(ts).isdigit():
+                return dt.datetime.fromtimestamp(int(ts), dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return None
+
+
+def filename_date(name: str) -> str | None:
+    match = FILENAME_DATE.search(name)
+    if not match:
+        return None
+    y, mo, d, h, mi, s = match.groups()
+    return f"{y}-{mo}-{d}T{h}:{mi}:{s or '00'}"
+
+
+def parse_csv_date(value: str) -> str | None:
     value = value.strip()
     if not value:
         return None
@@ -392,8 +476,8 @@ def parse_date(value):
             return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat()
         except (OverflowError, OSError, ValueError):
             return None
-    value = re.sub(r'\s*(UTC|GMT|Z)$', '+00:00', value, flags=re.I)
-    for candidate in (value, value.replace('/', '-')):
+    value = re.sub(r"\s*(UTC|GMT|Z)$", "+00:00", value, flags=re.I)
+    for candidate in (value, value.replace("/", "-")):
         try:
             parsed = dt.datetime.fromisoformat(candidate)
             if parsed.tzinfo is None:
@@ -401,688 +485,531 @@ def parse_date(value):
             return parsed.isoformat()
         except ValueError:
             pass
-    for fmt in (
-        '%Y:%m:%d %H:%M:%S',
-        '%Y-%m-%d %H:%M:%S',
-        '%Y-%m-%d',
-        '%m/%d/%Y %H:%M:%S',
-        '%B %d, %Y, %H:%M:%S',
-        '%b %d, %Y, %H:%M:%S',
-    ):
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S",
+                "%B %d, %Y, %H:%M:%S", "%b %d, %Y, %H:%M:%S"):
         try:
             return dt.datetime.strptime(value, fmt).replace(tzinfo=dt.timezone.utc).isoformat()
         except ValueError:
             pass
     return None
 
-rows = {}
-for current, dirs, files in os.walk(root):
-    dirs[:] = [d for d in dirs if d not in ('.done',) and not d.startswith('.tmp.')]
-    for filename in files:
-        if not filename.lower().endswith('.csv'):
-            continue
-        csv_path = os.path.join(current, filename)
+
+def load_csv_metadata(root: str) -> dict:
+    """CSV из экспорта Apple (Photo Details*.csv) → {имя файла: метаданные}; читается один раз."""
+
+    def norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    def pick(fields, pred):
+        return next((field for field, key in fields if pred(key)), None)
+
+    rows: dict = {}
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for filename in files:
+            if not filename.lower().endswith(".csv"):
+                continue
+            try:
+                with open(os.path.join(current, filename), "r", encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    if not reader.fieldnames:
+                        continue
+                    fields = [(f, norm(f)) for f in reader.fieldnames if f]
+                    name_f = pick(fields, lambda k: any(w in k for w in (
+                        "filename", "file name", "original filename", "original name", "media name")))
+                    date_f = (
+                        pick(fields, lambda k: k in ("date taken", "photo taken", "capture date", "creation date",
+                                                     "created date", "date"))
+                        or pick(fields, lambda k: any(w in k for w in ("captured", "taken", "created", "creation")))
+                        or pick(fields, lambda k: k in ("time", "capture time"))
+                    )
+                    time_f = pick(fields, lambda k: k in ("time", "capture time"))
+                    fav_f = pick(fields, lambda k: any(w in k for w in ("favorite", "is favorite", "favourite")))
+                    kw_f = pick(fields, lambda k: any(w in k for w in ("keywords", "keyword", "tags", "tag")))
+                    ppl_f = pick(fields, lambda k: any(w in k for w in ("people", "person", "faces", "face names")))
+                    if not name_f or not date_f:
+                        continue
+                    for row in reader:
+                        name = os.path.basename((row.get(name_f) or "").strip())
+                        time_value = (row.get(time_f) or "").strip() if time_f and time_f != date_f else ""
+                        date = parse_csv_date(f"{(row.get(date_f) or '').strip()} {time_value}".strip())
+                        if not name or not date:
+                            continue
+                        favorite = (row.get(fav_f) or "").strip().lower() if fav_f else ""
+                        meta: dict = {"date": date}
+                        if favorite in ("yes", "true", "1", "y", "да"):
+                            meta["favorite"] = True
+                        elif favorite in ("no", "false", "0", "n", "нет"):
+                            meta["favorite"] = False
+                        keywords = (row.get(kw_f) or "").strip() if kw_f else ""
+                        people = (row.get(ppl_f) or "").strip() if ppl_f else ""
+                        if keywords:
+                            meta["keywords"] = [x.strip() for x in keywords.replace(";", ",").split(",") if x.strip()]
+                        if people:
+                            meta["people"] = [{"name": x.strip()} for x in people.replace(";", ",").split(",")
+                                              if x.strip()]
+                        rows[name] = meta
+            except (OSError, UnicodeError, csv.Error):
+                continue
+    return rows
+
+
+# --- Импорт одного файла ----------------------------------------------------
+
+class Importer:
+    def __init__(self, api: Api) -> None:
+        self.api = api
+        self.journal = Journal(JOURNAL_DIR)
+        self.failed = FailedMemory(FAILED_FILE)
+        self.health = Health(FAIL_LIMIT)
+        self.stats = Stats()
+        self.exif = ExifTool()
+        self.legacy = False
+
+    # -- регистрация --
+
+    def finish_commit(self, file_id: str, src: str, dst: str) -> str:
+        status, body = self.api.register({"action": "commit", "fileId": file_id})
+        state = (body or {}).get("status")
+        if status == 200 and state in ("committed", "duplicate"):
+            self.journal.remove(file_id)
+            self.health.ok()
+            return "imported" if state == "committed" else "duplicate"
+        if status in (404, 409):
+            # Резерв истёк или сервер не видит файл: вернуть исходник, повторить позже.
+            log(f"commit rejected ({status} {state}): {os.path.basename(src)}; returning file to import folder")
+            try:
+                move_back(src, dst)
+            except OSError as exc:
+                log(f"move back failed for {dst}: {exc}")
+                return "failed"
+            self.api.register({"action": "release", "fileId": file_id})
+            self.journal.remove(file_id)
+            return "failed"
+        # Сеть/5xx: журнал остаётся в состоянии moved — довезём при следующем запуске.
+        self.health.fail(f"commit HTTP {status}")
+        return "failed"
+
+    def recover(self) -> None:
+        for file_id, record in self.journal.items():
+            src, dst, state = record.get("src", ""), record.get("dst", ""), record.get("state")
+            if state == "reserved":
+                if dst and os.path.exists(dst) and not os.path.exists(src):
+                    state = "moved"  # rename прошёл, журнал не успел обновиться
+                else:
+                    self.api.register({"action": "release", "fileId": file_id})
+                    self.journal.remove(file_id)
+                    continue
+            if state == "moved":
+                outcome = self.finish_commit(file_id, src, dst)
+                log(f"recovered {os.path.basename(src)}: {outcome}")
+
+    # -- основной путь --
+
+    def metadata_for(self, path: str, csv_meta: dict | None) -> tuple[str | None, dict | None]:
+        meta = (csv_meta or {}).get(os.path.basename(path))
+        captured = (meta or {}).get("date") or self.exif.capture_date(path) or sidecar_date(path) \
+            or filename_date(os.path.basename(path))
+        photos = {k: v for k, v in (meta or {}).items() if k in ("favorite", "keywords", "people")} or None
+        return captured, photos
+
+    def import_file(self, path: str, csv_meta: dict | None) -> str:
+        if STOP.is_set():
+            return "skipped"
         try:
-            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as handle:
-                reader = csv.DictReader(handle)
-                if not reader.fieldnames:
-                    continue
-                fields = [(field, normalize(field)) for field in reader.fieldnames if field]
-                name_field = next((field for field, key in fields if any(word in key for word in name_words)), None)
-                date_field = next(
-                    (
-                        field
-                        for field, key in fields
-                        if key in ('date taken', 'photo taken', 'capture date', 'creation date', 'created date', 'date')
-                    ),
-                    None,
-                )
-                date_field = date_field or next(
-                    (field for field, key in fields if any(word in key for word in ('captured', 'taken', 'created', 'creation'))),
-                    None,
-                )
-                date_field = date_field or next(
-                    (field for field, key in fields if key in ('time', 'capture time')), None
-                )
-                time_field = next((field for field, key in fields if key in ('time', 'capture time')), None)
-                favorite_field = next(
-                    (field for field, key in fields if any(word in key for word in favorite_words)), None
-                )
-                keyword_field = next(
-                    (field for field, key in fields if any(word in key for word in keyword_words)), None
-                )
-                people_field = next(
-                    (field for field, key in fields if any(word in key for word in people_words)), None
-                )
-                if not name_field or not date_field:
-                    continue
-                for row in reader:
-                    name = os.path.basename((row.get(name_field) or '').strip())
-                    date_value = (row.get(date_field) or '').strip()
-                    time_value = (row.get(time_field) or '').strip() if time_field else ''
-                    date = parse_date(f'{date_value} {time_value}'.strip())
-                    if name and date:
-                        favorite = (row.get(favorite_field) or '').strip().lower() if favorite_field else ''
-                        if favorite in ('yes', 'true', '1', 'y', 'да'):
-                            favorite = 'true'
-                        elif favorite in ('no', 'false', '0', 'n', 'нет'):
-                            favorite = 'false'
-                        else:
-                            favorite = ''
-                        keywords = (row.get(keyword_field) or '').strip() if keyword_field else ''
-                        people = (row.get(people_field) or '').strip() if people_field else ''
-                        rows[name] = (date, favorite, keywords, people)
-        except (OSError, UnicodeError, csv.Error):
-            continue
+            st = os.stat(path)
+        except FileNotFoundError:
+            return "skipped"
+        if st.st_size == 0:
+            return "skipped"
+        key = f"{path}|{st.st_size}|{int(st.st_mtime)}"
+        if self.failed.should_skip(key):
+            return "skipped"
+        try:
+            content_hash = sha256_file(path)
+        except OSError as exc:
+            self.failed.note(key)
+            self.health.fail(f"read {os.path.basename(path)}: {exc}")
+            return "failed"
+        captured, photos = self.metadata_for(path, csv_meta)
+        name = os.path.basename(path)
+        if self.legacy:
+            return self.upload_legacy(path, key, content_hash, captured, photos)
 
-with open(output, 'w', encoding='utf-8') as handle:
-    for name, fields in sorted(rows.items()):
-        values = '\t'.join(fields)
-        handle.write(f'{name}\t{values}\n')
-PY
-}
+        reserve = {"action": "reserve", "originalName": name, "sizeBytes": st.st_size, "contentHash": content_hash,
+                   "capturedAt": captured, "photosMeta": photos}
+        for unique in (False, True):
+            reserve["unique"] = unique
+            status, body = self.api.register(reserve)
+            if status == 404 and not (body or {}).get("status"):
+                log("dashboard has no /import/register yet; falling back to upload")
+                self.legacy = True
+                return self.upload_legacy(path, key, content_hash, captured, photos)
+            if status == 401:
+                raise Fatal("dashboard rejected the token (HTTP 401)")
+            if status == 400:
+                log(f"rejected {name}: {(body or {}).get('error')}")
+                self.failed.note(key)
+                return "failed"
+            if status != 200 or not body:
+                self.health.fail(f"reserve HTTP {status}")
+                return "failed"
+            self.health.ok()
+            state = body.get("status")
+            if state == "duplicate":
+                os.remove(path)
+                self.failed.clear(key)
+                return "duplicate"
+            if state != "reserved":
+                return "busy"
+            file_id, rel = str(body["fileId"]), str(body["path"])
+            dst = safe_join(FILES_ROOT, rel)
+            if dst is None or os.path.lexists(dst):
+                self.api.register({"action": "release", "fileId": file_id})
+                if dst is None:
+                    log(f"unsafe gallery path from dashboard: {rel}")
+                    return "failed"
+                continue  # путь занят на диске — второй резерв с уникальным именем
+            break
+        else:
+            return "failed"
 
-csv_metadata_for() {
-  local file="$1" csv_name csv_date csv_favorite csv_keywords csv_people
-  [[ -n "${CSV_META_FILE:-}" && -s "$CSV_META_FILE" ]] || return 0
-  while IFS=$'\t' read -r csv_name csv_date csv_favorite csv_keywords csv_people; do
-    if [[ "$csv_name" == "$(basename "$file")" ]]; then
-      printf '%s\t%s\t%s\t%s\n' "$csv_date" "$csv_favorite" "$csv_keywords" "$csv_people"
-      return 0
-    fi
-  done < "$CSV_META_FILE"
-}
+        self.journal.write(file_id, {"src": path, "dst": dst, "state": "reserved", "ts": time.time()})
+        try:
+            move_into_gallery(path, dst, content_hash)
+        except OSError as exc:
+            self.api.register({"action": "release", "fileId": file_id})
+            self.journal.remove(file_id)
+            self.failed.note(key)
+            self.health.fail(f"move {name}: {exc}")
+            return "failed"
+        self.journal.write(file_id, {"src": path, "dst": dst, "state": "moved", "ts": time.time()})
+        outcome = self.finish_commit(file_id, path, dst)
+        if outcome == "failed":
+            self.failed.note(key)
+        else:
+            self.failed.clear(key)
+        return outcome
 
-photos_metadata_for() {
-  local file="$1" csv_meta csv_favorite csv_keywords csv_people
-  csv_meta="$(csv_metadata_for "$file")"
-  IFS=$'\t' read -r _ csv_favorite csv_keywords csv_people <<< "$csv_meta"
-  [[ -n "$csv_favorite$csv_keywords$csv_people" ]] || return 0
-  python3 - "$csv_favorite" "$csv_keywords" "$csv_people" <<'PY'
-import json
-import sys
+    def upload_legacy(self, path: str, key: str, content_hash: str, captured: str | None,
+                      photos: dict | None) -> str:
+        """Старый дашборд без /register: загрузка файла, как делал прежний скрипт."""
+        name = os.path.basename(path)
+        auth = [f"Authorization: Bearer {TOKEN}", "X-NAS-Agent-Id: archive-import"]
+        cmd = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "30", "-m", "900"]
+        for header in auth:
+            cmd += ["-H", header]
+        if os.path.splitext(name)[1].lower() in VIDEO_EXT:
+            ctype = "video/quicktime" if name.lower().endswith(".mov") else "video/mp4"
+            cmd += ["--upload-file", path, "-H", f"Content-Type: {ctype}",
+                    "-H", f"X-File-Name: {urllib.parse.quote(name)}"]
+            if captured:
+                cmd += ["-H", f"X-Captured-At: {captured}"]
+            if photos:
+                cmd += ["-H", f"X-Photos-Meta: {json.dumps(photos, ensure_ascii=True)}"]
+            cmd.append(f"{DASHBOARD_URL}/api/sync/nas/import/stream")
+        else:
+            cmd += ["-F", f'file=@"{curl_quote(path)}";filename="{curl_quote(name)}"',
+                    "--form-string", f"fileName={name}", "--form-string", f"contentHash={content_hash}"]
+            if captured:
+                cmd += ["--form-string", f"capturedAt={captured}"]
+            if photos:
+                cmd += ["--form-string", f"photosMeta={json.dumps(photos, ensure_ascii=True)}"]
+            cmd.append(f"{DASHBOARD_URL}/api/sync/nas/import")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        code = result.stdout.strip()[-3:]
+        if code in ("200", "201"):
+            self.health.ok()
+            os.remove(path)
+            self.failed.clear(key)
+            return "imported" if code == "201" else "duplicate"
+        self.failed.note(key)
+        if code in ("503", "000", ""):
+            self.health.fail(f"upload HTTP {code or '000'}")
+        else:
+            log(f"upload failed (HTTP {code}): {name}")
+        return "failed"
 
-favorite, keywords, people = sys.argv[1:]
-out = {}
-if favorite in ('true', 'false'):
-    out['favorite'] = favorite == 'true'
-if keywords:
-    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
-if people:
-    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
-print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
-PY
-}
 
-metadata_backfill() {
-  local list="$IMPORT_STATE_DIR/.tmp-csv-meta.tsv" file captured hash meta response
-  local matched=0 updated=0 failed=0 signature previous csv_count
-  csv_count="$(find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -print 2>/dev/null | wc -l)"
-  if [[ "$csv_count" -eq 0 ]]; then
-    log "no CSV metadata in $IMPORT_ROOT/.done"
-    purge_done
-    return 0
-  fi
-  signature="$({
-    find "$IMPORT_ROOT/.done" -type f -iname '*.csv' -printf 'csv\t%p\t%s\t%T@\n' 2>/dev/null
-    find "$IMPORT_ROOT/.done" -type f \( \
-      -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
-      -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
-      -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
-      -o -iname '*.3gp' \
-    \) -printf 'media\t%p\t%s\t%T@\n' 2>/dev/null
-  } | sort | sha256sum | cut -d' ' -f1)"
-  if [[ -f "$META_STATE_FILE" ]]; then
-    IFS= read -r previous < "$META_STATE_FILE" || true
-    if [[ "$previous" == "$signature" ]]; then
-      return 0
-    fi
-  fi
-  build_csv_metadata "$IMPORT_ROOT/.done" "$list"
-  [[ -s "$list" ]] || { rm -f "$list"; log "CSV metadata has no usable rows"; return 0; }
+def curl_quote(value: str) -> str:
+    """Значение в кавычках для curl -F: внутри понимаются только \\\\ и \\\"."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
-  while IFS=$'\t' read -r file captured favorite keywords people; do
-    local media
-    media="$(find "$IMPORT_ROOT/.done" -type f -iname "$file" -print -quit 2>/dev/null || true)"
-    [[ -n "$media" ]] || continue
-    hash="$(sha256sum "$media" | cut -d' ' -f1)"
-    meta="$(python3 - "$file" "$hash" "$captured" "$favorite" "$keywords" "$people" <<'PY'
-import json
-import sys
 
-name, content_hash, captured_at, favorite, keywords, people = sys.argv[1:]
-out = {
-    'originalName': name,
-    'contentHash': content_hash,
-    'capturedAt': captured_at,
-}
-if favorite in ('true', 'false'):
-    out['favorite'] = favorite == 'true'
-if keywords:
-    out['keywords'] = [x.strip() for x in keywords.replace(';', ',').split(',') if x.strip()]
-if people:
-    out['people'] = [{'name': x.strip()} for x in people.replace(';', ',').split(',') if x.strip()]
-print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
-PY
-    )"
-    response="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' --data-binary "$meta" "$META_API" 2>/dev/null || true)"
-    if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e . >/dev/null 2>&1; then
-      failed=$((failed + 1))
-      continue
-    fi
-    reset_storage_failures
-    if [[ "$(printf '%s' "$response" | jq -r '.matched // false' 2>/dev/null)" == "true" ]]; then
-      matched=$((matched + 1))
-      [[ "$(printf '%s' "$response" | jq -r '.updated // false' 2>/dev/null)" == "true" ]] && updated=$((updated + 1))
-    fi
-  done < "$list"
-  rm -f "$list"
-  if [[ "$failed" -gt 0 ]]; then
-    log "metadata backfill: matched=$matched updated=$updated failed=$failed"
-    return 1
-  fi
-  mkdir -p "$(dirname "$META_STATE_FILE")"
-  printf '%s\n' "$signature" > "$META_STATE_FILE"
-  log "metadata backfill: matched=$matched updated=$updated"
-  purge_done
-}
+# --- Обход ------------------------------------------------------------------
 
-purge_done() {
-  find "$IMPORT_ROOT/.done" -type f \( \
-    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
-    -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
-    -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
-    -o -iname '*.3gp' -o -iname '*.zip' \
-  \) -delete 2>/dev/null || true
-  find "$IMPORT_ROOT/.done" -depth -type d ! -path "$IMPORT_ROOT/.done" -empty -delete 2>/dev/null || true
-}
+class ListingStalled(Exception):
+    pass
 
-send_metadata_for() {
-  local file="$1" hash="$2" captured="$3" photos_meta="$4" payload code
-  payload="$(python3 - "$file" "$hash" "$captured" "$photos_meta" <<'PY'
-import json
-import sys
 
-name, content_hash, captured_at, photos_meta = sys.argv[1:]
-out = {'originalName': name, 'contentHash': content_hash}
-if captured_at:
-    out['capturedAt'] = captured_at
-if photos_meta:
-    out.update(json.loads(photos_meta))
-print(json.dumps(out, ensure_ascii=True, separators=(',', ':')))
-PY
-  )"
-  code="$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -H 'Content-Type: application/json' \
-    --data-binary "$payload" "$META_API" 2>/dev/null || true)"
-  case "$(printf '%s' "$code" | tail -c 3)" in
-    2*) reset_storage_failures ;;
-  esac
-  return 0
-}
+def iter_dir(path: str, idle_timeout: int):
+    """Потоковый листинг: записи отдаются по мере чтения; сторож простоя на каждую запись."""
+    entries: queue.Queue = queue.Queue(maxsize=2000)
 
-remove_loose_after_success() {
-  rm -f -- "$1"
-}
+    def producer() -> None:
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    entries.put(("entry", entry.path, entry.name, is_dir))
+            entries.put(("end", None, None, None))
+        except OSError as exc:
+            entries.put(("error", str(exc), None, None))
 
-prune_empty_import_dirs() {
-  find "$IMPORT_ROOT" -depth -type d \
-    ! -path "$IMPORT_ROOT" \
-    ! -path "$IMPORT_ROOT/.done" \
-    ! -path "$IMPORT_ROOT/.done/*" \
-    ! -path "$IMPORT_ROOT/.tmp.*" \
-    -empty -delete 2>/dev/null || true
-}
+    threading.Thread(target=producer, daemon=True).start()
+    while True:
+        try:
+            kind, a, b, c = entries.get(timeout=idle_timeout)
+        except queue.Empty:
+            raise ListingStalled(path) from None
+        if kind == "end":
+            return
+        if kind == "error":
+            raise OSError(a)
+        yield a, b, c
 
-find_next_loose_media() {
-  local file
-  NEXT_LOOSE_FILE=""
-  while IFS= read -r -d '' file; do
-    if is_media "$file" && ! is_video "$file"; then
-      NEXT_LOOSE_FILE="$file"
-      return 0
-    fi
-  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
-    ! -name '*.csv' -print0 2>/dev/null)
-  while IFS= read -r -d '' file; do
-    if is_media "$file"; then
-      NEXT_LOOSE_FILE="$file"
-      return 0
-    fi
-  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f \
-    ! -name '*.csv' -print0 2>/dev/null)
-  return 1
-}
 
-# --- Обход loose-файлов по папкам -------------------------------------------
-# Полный рекурсивный find по всему дереву застревает на больших папках Photos.
-# Вместо него — персистентная BFS-очередь папок: берём папку из головы, листаем
-# её один раз (maxdepth 1), загружаем файлы, найденные подпапки дописываем в
-# конец очереди. Так обход доходит до любого уровня вложенности. Очередь живёт
-# в IMPORT_STATE_DIR (локальный /data), а не на сетевом шаре.
-# Скан папки ограничен таймаутом; упавшая папка возвращается в конец очереди.
+class Walker:
+    def __init__(self, importer: Importer) -> None:
+        self.imp = importer
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL)
+        self.slots = threading.BoundedSemaphore(PARALLEL * 2)
+        self.pending: set = set()
+        self.pending_lock = threading.Lock()
 
-LOOSE_DIR_SCAN_TIMEOUT="${IMPORT_DIR_SCAN_TIMEOUT:-180}"
-# Значение из окружения принимаем только как целое > 0; иначе — безопасное 180.
-if ! [[ "$LOOSE_DIR_SCAN_TIMEOUT" =~ ^[0-9]+$ ]] || (( LOOSE_DIR_SCAN_TIMEOUT <= 0 )); then
-  LOOSE_DIR_SCAN_TIMEOUT=180
-fi
-# 0 = без ограничения по числу папок (ограничиваем только временем прогона).
-LOOSE_DIR_BUDGET="${IMPORT_DIR_BUDGET:-0}"
-# Максимальная длительность одного прогона обхода, секунды (0 = без лимита).
-LOOSE_RUN_SECONDS="${IMPORT_LOOSE_RUN_SECONDS:-600}"
+    def rel(self, path: str) -> str:
+        return os.path.relpath(path, IMPORT_ROOT) if path != IMPORT_ROOT else "."
 
-build_loose_dir_queue() {
-  # Начинаем с корня; подпапки добавляются по мере обхода (см. process_loose_dir).
-  printf '%s\n' "$IMPORT_ROOT" > "$1"
-}
+    def submit(self, path: str, csv_meta: dict | None) -> concurrent.futures.Future:
+        self.slots.acquire()
+        future = self.pool.submit(self.imp.import_file, path, csv_meta)
 
-# Обработка одного loose-файла: хеш, дедуп, загрузка. Счётчики done/skipped/failed
-# берутся из вызывающей process_loose_dir (динамическая область видимости bash).
-process_loose_file() {
-  local file="$1"
-  local hash="" existing captured="" photos_meta=""
-  local csv_meta csv_favorite csv_keywords csv_people http_code file_dir file_base
-  if ! is_video "$file"; then
-    hash_with_heartbeat "$file" "loose files" "$RUN_PROCESSED" 0 0 || {
-      failed=$((failed + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
-      log "hash failed/timeout: $(basename "$file")"
-      return 1
-    }
-    hash="$HASH_VALUE"
-  fi
-  existing=""
-  check_hash_existing "$hash" || true
-  existing="$EXISTING_VALUE"
-  if [[ -n "$existing" ]]; then
-    csv_meta="$(csv_metadata_for "$file")"
-    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-    captured="${captured:-$(capture_date_for "$file")}"
-    photos_meta="$(photos_metadata_for "$file")"
-    if [[ -n "$photos_meta" || -n "$captured" ]]; then
-      send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
-    fi
-    skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
-    remove_loose_after_success "$file"
-    return 0
-  fi
-  csv_meta="$(csv_metadata_for "$file")"
-  IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-  captured="${captured:-$(capture_date_for "$file")}"
-  photos_meta=""
-  if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
-    photos_meta="$(photos_metadata_for "$file")"
-  fi
-  file_dir="$(dirname "$file")"
-  file_base="$(basename "$file")"
-  if is_video "$file"; then
-    local stream_type="video/mp4"
-    [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
-    UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
-    [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
-    [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
-    UPLOAD_ENDPOINT="$STREAM_API"
-    # Битое/зависшее чтение видео не должно блокировать очередь на 15 мин.
-    UPLOAD_TIMEOUT="${IMPORT_VIDEO_UPLOAD_TIMEOUT_SECONDS:-180}"
-  else
-    local -a form_args=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
-    [[ -n "$captured" ]] && form_args+=(--form-string "capturedAt=$captured")
-    [[ -n "$hash" ]] && form_args+=(--form-string "contentHash=$hash")
-    [[ -n "$photos_meta" ]] && form_args+=(--form-string "photosMeta=$photos_meta")
-    UPLOAD_ARGS=("${form_args[@]}")
-    UPLOAD_ENDPOINT="$API"
-    UPLOAD_TIMEOUT="${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}"
-  fi
-  UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"
-  UPLOAD_DONE="$RUN_PROCESSED"; UPLOAD_TOTAL=0; UPLOAD_PENDING=0
-  upload_with_heartbeat || true
-  http_code="$UPLOAD_HTTP_CODE"
-  case "$http_code" in
-    200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
-    413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
-    503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
-    000)
-      if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
-        failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
-      else
-        failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
-      fi ;;
-    *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
-  esac
-  RUN_PROCESSED=$((RUN_PROCESSED + 1))
-  return 0
-}
+        def done(f: concurrent.futures.Future) -> None:
+            self.slots.release()
+            with self.pending_lock:
+                self.pending.discard(f)
+            if f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                if not isinstance(exc, (StorageDown, Fatal)):
+                    log(f"unexpected error for {os.path.basename(path)}: {exc!r}")
+                self.imp.stats.add("failed")
+                STOP.set()
+                self.error = exc
+            else:
+                self.imp.stats.add(f.result())
 
-process_loose_dir() {
-  local dir="$1" subdirs_out="$2"
-  local entry file deferred fifo hb_pid find_pid find_rc first read_rc stalled
-  local done=0 skipped=0 failed=0
-  deferred="$(mktemp "$IMPORT_STATE_DIR/.deferred.XXXXXX")"
-  fifo="$(mktemp "$IMPORT_STATE_DIR/.fifo.XXXXXX")"
-  rm -f "$fifo"
-  if ! mkfifo "$fifo"; then
-    rm -f "$deferred"
-    log "cannot create fifo for dir scan: $dir"
-    return 1
-  fi
-  : > "$subdirs_out"
-  report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"
-  # Heartbeat, пока листинг не отдал ни одной записи: статус не должен «протухать».
-  ( while sleep 45; do report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"; done ) &
-  hb_pid=$!
-  first=1
-  # Один проход по каталогу; тип записи НЕ запрашиваем у хранилища (-type убран),
-  # файлы обрабатываются по мере поступления, подкаталоги собираются здесь же.
-  find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "$fifo" &
-  find_pid=$!
-  read_rc=0
-  while :; do
-    if IFS= read -r -d '' -t "$LOOSE_DIR_SCAN_TIMEOUT" entry <&3; then
-      if (( first )); then
-        kill "$hb_pid" 2>/dev/null || true
-        wait "$hb_pid" 2>/dev/null || true
-        first=0
-      fi
-      if is_media "$entry"; then
-        if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$entry"; then
-          skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
-          continue
-        fi
-        if is_video "$entry"; then
-          # Видео откладываем: фото должны уйти раньше, не делая второй листинг.
-          printf '%s\0' "$entry" >> "$deferred"
-        else
-          report running "loose files" "$RUN_PROCESSED" 0 0 "$(basename "$entry")"
-          process_loose_file "$entry"
-        fi
-      elif [[ -d "$entry" ]]; then
-        # Служебные каталоги (.done, .tmp*) в очередь не ставим — как и прежде
-        # делал collect_subdirs: там лежат уже обработанные файлы и CSV.
-        case "$(basename "$entry")" in
-          .done|.tmp*) ;;
-          *) printf '%s\n' "$entry" >> "$subdirs_out" ;;
-        esac
-      fi
-    else
-      read_rc=$?
-      break
-    fi
-  done 3< "$fifo"
-  if (( first )); then
-    kill "$hb_pid" 2>/dev/null || true
-    wait "$hb_pid" 2>/dev/null || true
-  fi
-  # Сторож простоя: read -t отсчитывается только пока ждём следующую запись.
-  # 1 = EOF (find завершился), >128 = простой (данных не было дольше таймаута).
-  stalled=0
-  if (( read_rc > 128 )); then
-    stalled=1
-    log "dir scan stalled: $dir (no entries for ${LOOSE_DIR_SCAN_TIMEOUT}s)"
-  fi
-  if (( stalled )); then
-    # Мягко, затем принудительно после короткого грейс-периода.
-    kill "$find_pid" 2>/dev/null || true
-    sleep 5
-    kill -9 "$find_pid" 2>/dev/null || true
-  fi
-  if wait "$find_pid"; then find_rc=0; else find_rc=$?; fi
-  rm -f "$fifo"
-  # Отложенные видео — после фото этой папки.
-  if [[ -s "$deferred" ]]; then
-    while IFS= read -r -d '' file; do
-      [[ -e "$file" ]] || continue
-      process_loose_file "$file"
-    done < "$deferred"
-  fi
-  rm -f "$deferred"
-  if (( stalled )) || (( find_rc != 0 )); then
-    # Простой/ошибка листинга: подпапки уже частично собраны, обработанные файлы
-    # не откатываются. Каталог попадёт в счётчик попыток.
-    log "dir scan failed/timeout: $dir (stalled=$stalled find rc=$find_rc)"
-    return 1
-  fi
-  log "dir done $(basename "$dir"): imported=$done skipped=$skipped failed=$failed"
-  return 0
-}
+        with self.pending_lock:
+            self.pending.add(future)
+        future.add_done_callback(done)
+        return future
 
-process_loose_import() {
-  # Guard до любых операций под IMPORT_ROOT: на отмонтированной шаре нельзя
-  # создавать .done и служебные файлы — непустая точка монтирования блокирует
-  # восстановление монтирования Supervisor'ом.
-  storage_guard
-  local q="$IMPORT_STATE_DIR/loose-dirs.list"
-  local tries="$IMPORT_STATE_DIR/loose-dir-tries"
-  local sub_tmp
-  # Убираем служебные файлы, которые прежние версии оставили в IMPORT_ROOT.
-  rm -f "$IMPORT_ROOT/.tmp-loose-dirs.list" "$IMPORT_ROOT/.tmp-loose-dir-tries" 2>/dev/null || true
-  mkdir -p "$IMPORT_ROOT/.done"
-  [[ -s "$q" ]] || build_loose_dir_queue "$q"
+    error: BaseException | None = None
 
-  # Очередь держим в памяти (O(1) на элемент), подпапки дописываем по ходу.
-  local -a queue=()
-  mapfile -t queue < "$q"
-  local head=0 n=0 start now dir cnt sub d
-  local -A seen=()
-  # Дедуплицируем очередь: прежние версии могли оставить хвост с дублями.
-  if (( ${#queue[@]} > 0 )); then
-    mapfile -t queue < <(printf '%s\n' "${queue[@]}" | sort -u)
-  fi
-  for d in ${queue[@]+"${queue[@]}"}; do
-    [[ -n "$d" ]] && seen["$d"]=1
-  done
-  start="$(date +%s)"
-  sub_tmp="$(mktemp "$IMPORT_STATE_DIR/.subdirs.XXXXXX")"
+    def wait(self, futures) -> None:
+        concurrent.futures.wait(list(futures))
 
-  while (( head < ${#queue[@]} )); do
-    if (( LOOSE_DIR_BUDGET > 0 )) && (( n >= LOOSE_DIR_BUDGET )); then
-      log "dir budget reached ($LOOSE_DIR_BUDGET); continuing next run"
-      break
-    fi
-    if (( LOOSE_RUN_SECONDS > 0 )); then
-      now="$(date +%s)"
-      if (( now - start >= LOOSE_RUN_SECONDS )); then
-        log "run time budget reached (${LOOSE_RUN_SECONDS}s); continuing next run"
-        break
-      fi
-    fi
-    dir="${queue[$head]}"
-    head=$((head + 1))
-    n=$((n + 1))
-    [[ -d "$dir" ]] || continue
-    local rc=0
-    if process_loose_dir "$dir" "$sub_tmp"; then rc=0; else rc=$?; fi
-    # Подпапки добавляем в очередь независимо от успеха папки: таймаут
-    # листинга не должен отрезать всё поддерево от обхода.
-    if [[ -s "$sub_tmp" ]]; then
-      while IFS= read -r sub; do
-        [[ -n "$sub" ]] || continue
-        if [[ -z "${seen[$sub]:-}" ]]; then
-          seen["$sub"]=1
-          queue+=("$sub")
-        fi
-      done < "$sub_tmp"
-    fi
-    if (( rc == 0 )); then
-      if [[ -f "$tries" ]]; then
-        grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null && mv "$tries.tmp" "$tries" || rm -f "$tries.tmp"
-      fi
-    else
-      cnt=0
-      if [[ -f "$tries" ]]; then
-        cnt="$(awk -F'\t' -v d="$dir" '$1==d{print $2}' "$tries" 2>/dev/null | tail -1 || true)"
-      fi
-      cnt=$(( ${cnt:-0} + 1 ))
-      if [[ -f "$tries" ]]; then
-        grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null || true
-      fi
-      printf '%s\t%s\n' "$dir" "$cnt" >> "$tries.tmp"
-      mv "$tries.tmp" "$tries" 2>/dev/null || true
-      if (( cnt <= 3 )); then
-        queue+=("$dir")
-      else
-        log "dir skipped after $cnt failures: $dir"
-      fi
-    fi
-  done
-  rm -f "$sub_tmp"
+    def scan_dir(self, path: str, csv_meta: dict | None):
+        """Файлы в работу сразу по мере листинга; видео — после фото папки; архивы — после."""
+        self.imp.stats.where = self.rel(path)
+        subdirs, videos, archives, futures = [], [], [], []
+        for full, name, is_dir in iter_dir(path, DIR_TIMEOUT):
+            if STOP.is_set():
+                break
+            if name.startswith("."):  # .done, .tmp.*, .DS_Store, ._AppleDouble
+                continue
+            if is_dir:
+                subdirs.append(full)
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext == ".zip":
+                archives.append(full)
+            elif ext in VIDEO_EXT:
+                if not SKIP_VIDEOS:
+                    videos.append(full)
+            elif ext in PHOTO_EXT:
+                futures.append(self.submit(full, csv_meta))
+        for video in videos:
+            if STOP.is_set():
+                break
+            futures.append(self.submit(video, csv_meta))
+        return subdirs, archives, futures
 
-  # Сохраняем необработанный хвост очереди для следующего прогона.
-  : > "$q"
-  if (( head < ${#queue[@]} )); then
-    printf '%s\n' "${queue[@]:head}" | sort -u >> "$q"
-  else
-    log "loose walk complete: no directories left"
-    report idle "waiting for Apple media" 0 0 0
-    prune_empty_import_dirs
-  fi
-  local pending
-  pending="$(wc -l < "$q" 2>/dev/null || echo 0)"
-  log "loose batch done: dirs=$n pending=$pending"
-  return 0
-}
+    def walk_tree(self, root: str, csv_meta: dict | None) -> int:
+        """Полный обход поддерева (для распакованного архива). → число неудачных файлов."""
+        stack, futures, stalled = [root], [], 0
+        while stack and not STOP.is_set():
+            current = stack.pop()
+            try:
+                subdirs, archives, found = self.scan_dir(current, csv_meta)
+            except (ListingStalled, OSError) as exc:
+                log(f"archive dir scan failed: {current}: {exc}")
+                stalled += 1
+                continue
+            futures += found
+            stack += subdirs
+            for archive in archives:  # архив в архиве — как обычный
+                self.process_archive(archive)
+        self.wait(futures)
+        failed = sum(1 for f in futures if f.cancelled() or f.exception() or f.result() in ("failed", "busy"))
+        return failed + stalled
 
-has_pending_loose_media() {
-  local file
-  while IFS= read -r -d '' file; do
-    if is_media "$file"; then return 0; fi
-  done < <(find "$IMPORT_ROOT" -type d \( -name .done -o -name '.tmp*' \) -prune -o -type f -print0 2>/dev/null)
-  return 1
-}
+    def process_archive(self, archive: str) -> None:
+        name = os.path.basename(archive)
+        tag = hashlib.sha1(archive.encode("utf-8")).hexdigest()[:8]
+        work = os.path.join(IMPORT_ROOT, f".tmp.{tag}")
+        marker = os.path.join(work, ".unpacked")
+        self.imp.stats.where = name
+        if not os.path.exists(marker):
+            log(f"unpacking {name}")
+            try:
+                with zipfile.ZipFile(archive) as zf:
+                    for info in zf.infolist():
+                        target = safe_join(work, info.filename)
+                        if target is None or info.is_dir():
+                            continue
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(info) as src, open(target, "wb") as out:
+                            shutil.copyfileobj(src, out, HASH_CHUNK)
+                with open(marker, "w", encoding="utf-8"):
+                    pass
+            except (OSError, zipfile.BadZipFile) as exc:
+                log(f"unpack failed {name}: {exc}")
+                self.imp.failed.note(f"{archive}|zip")
+                return
+        csv_meta = load_csv_metadata(work)
+        failed = self.walk_tree(work, csv_meta)
+        if failed == 0 and not STOP.is_set():
+            os.remove(archive)
+            shutil.rmtree(work, ignore_errors=True)
+            log(f"archive done: {name}")
+        else:
+            # Уже перенесённые файлы из распаковки ушли; остаток довезём следующим прогоном.
+            log(f"archive incomplete: {name} (failed={failed}); will resume")
 
-process_archive() {
-  local archive="$1" work_dir done=0 skipped=0 failed=0
-  work_dir="$(mktemp -d "$IMPORT_ROOT/.tmp.XXXXXX")"
-  log "unpacking $(basename "$archive")"
-  if ! unzip -q -o "$archive" -d "$work_dir"; then
-    rm -rf "$work_dir"
-    fail unpack "$(basename "$archive")"
-  fi
+    def run(self) -> int:
+        state = read_json(WALK_FILE, {})
+        queue_: list = [d for d in state.get("queue", []) if isinstance(d, str)] or [IMPORT_ROOT]
+        delays: dict = state.get("delays", {}) if isinstance(state.get("delays"), dict) else {}
+        seen = set(queue_)
+        deadline = time.time() + RUN_SECONDS
+        budget_hit = False
+        skipped_in_row = 0
+        futures: list = []
 
-  # Собираем список медиафайлов
-  local list="$work_dir/.files.list"
-  CSV_META_FILE="$work_dir/.csv-meta.tsv"
-  build_csv_metadata "$work_dir" "$CSV_META_FILE"
-  find "$work_dir" -type f ! -name '*.json' ! -name '.*' -print0 > "$list" 2>/dev/null || true
-  prioritize_media_list "$list"
-  # total = число медиафайлов (не всех подряд): считаем заранее для прогресс-бара.
-  local total=0 f
-  while IFS= read -r -d '' f; do is_media "$f" && total=$((total + 1)); done < "$list"
-  # -1: текущий архив уже в работе, не считаем его в «осталось»
-  local pending=$(( $(count_pending_archives) - 1 ))
-  report running "$(basename "$archive")" 0 "$total" "$pending"
+        def save() -> None:
+            write_json_atomic(WALK_FILE, {"queue": queue_, "delays": delays})
 
-  local file hash existing captured
-  while IFS= read -r -d '' file; do
-    is_media "$file" || continue
-    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "$(basename "$file")"
-    hash=""
-    if ! is_video "$file"; then
-      hash_with_heartbeat "$file" "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; note_storage_failure; continue
-      }
-      hash="$HASH_VALUE"
-    else
-      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending" "uploading $(basename "$file")"
-    fi
-    # Дедуп против БД
-    check_hash_existing "$hash" || true
-    existing="$EXISTING_VALUE"
-    if [[ -n "$existing" ]]; then
-      local csv_meta csv_favorite csv_keywords csv_people
-      csv_meta="$(csv_metadata_for "$file")"
-      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-      captured="${captured:-$(capture_date_for "$file")}"
-      photos_meta="$(photos_metadata_for "$file")"
-      if [[ -n "$photos_meta" || -n "$captured" ]]; then
-        send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
-      fi
-      skipped=$((skipped + 1))
-      report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
-      continue
-    fi
-    local csv_meta csv_favorite csv_keywords csv_people photos_meta
-    csv_meta="$(csv_metadata_for "$file")"
-    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-    captured="${captured:-$(capture_date_for "$file")}"
-    # Загрузка
-    local http_code file_size file_dir file_base
-    file_size="$(stat -c%s "$file" 2>/dev/null || printf '?')"
-    log "uploading $(basename "$file") size=${file_size} bytes"
-    file_dir="$(dirname "$file")"
-    file_base="$(basename "$file")"
-    local -a archive_form=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
-    [[ -n "$captured" ]] && archive_form+=(--form-string "capturedAt=$captured")
-    photos_meta="$(photos_metadata_for "$file")"
-    [[ -n "$photos_meta" ]] && archive_form+=(--form-string "photosMeta=$photos_meta")
-    [[ -n "$hash" ]] && archive_form+=(--form-string "contentHash=$hash")
-    if is_video "$file"; then
-      local stream_type="video/mp4"
-      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
-      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
-      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
-      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
-      UPLOAD_ENDPOINT="$STREAM_API"
-    else
-      UPLOAD_ARGS=("${archive_form[@]}")
-      UPLOAD_ENDPOINT="$API"
-    fi
-    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="$(basename "$archive")"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING="$pending"
-    upload_with_heartbeat || true
-    http_code="$UPLOAD_HTTP_CODE"
-    case "$http_code" in
-      200|201) done=$((done + 1)); reset_storage_failures ;;
-      413) skipped=$((skipped + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
-      503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
-      000)
-        if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
-          failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
-        else
-          failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
-        fi ;;
-      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
-    esac
-    update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
-    report running "$(basename "$archive")" $((done + skipped + failed)) "$total" "$pending"
-  done < "$list"
+        while queue_ and not STOP.is_set():
+            if time.time() >= deadline:
+                budget_hit = True
+                log(f"run time budget reached ({RUN_SECONDS}s); continuing next run")
+                break
+            current = queue_.pop(0)
+            delay = delays.get(current)
+            if delay and delay.get("next", 0) > time.time():
+                queue_.append(current)
+                skipped_in_row += 1
+                if skipped_in_row >= len(queue_):
+                    break  # остались только отложенные папки
+                continue
+            skipped_in_row = 0
+            if not os.path.isdir(current):
+                seen.discard(current)
+                continue
+            try:
+                subdirs, archives, found = self.scan_dir(current, None)
+                delays.pop(current, None)
+            except (ListingStalled, OSError) as exc:
+                # Файлы, отданные до простоя, уже в работе; папку повторим позже с растущей паузой.
+                count = int((delay or {}).get("n", 0)) + 1
+                delays[current] = {"n": count, "next": time.time() + min(300 * 2 ** (count - 1), 21600)}
+                log(f"dir scan stalled/failed: {self.rel(current)} ({exc}); retry #{count} later")
+                queue_.append(current)
+                save()
+                continue
+            futures += found
+            for sub in subdirs:
+                if sub not in seen:
+                    seen.add(sub)
+                    queue_.append(sub)
+            for archive in archives:
+                self.process_archive(archive)
+            if current != IMPORT_ROOT:
+                try:
+                    os.rmdir(current)  # удалится только пустая
+                except OSError:
+                    pass
+            futures = [f for f in futures if not f.done()]
+            save()
 
-  rm -rf "$work_dir"
-  CSV_META_FILE=""
-  mkdir -p "$IMPORT_ROOT/.done"
-  # Сохраняем относительный путь подпапки, чтобы одинаковые имена архивов не конфликтовали.
-  local rel_path done_path done_dir
-  rel_path="${archive#"$IMPORT_ROOT"/}"
-  done_path="$IMPORT_ROOT/.done/$rel_path"
-  done_dir="$(dirname "$done_path")"
-  mkdir -p "$done_dir"
-  if [[ "$failed" -eq 0 ]]; then
-    rm -f -- "$archive"
-  fi
-  log "done $rel_path: imported=$done skipped=$skipped failed=$failed"
-  update_state "$rel_path" "$done" "$skipped" "$failed"
-  if [[ "$failed" -gt 0 ]]; then
-    report error "$rel_path" $((done + skipped + failed)) "$total" "$pending" "failed=$failed"
-    return 1
-  fi
-  report completed "$rel_path" $((done + skipped)) "$total" "$pending"
-  purge_done
-}
+        self.wait(futures)
+        self.pool.shutdown(wait=True)
+        # Проход завершён (остались только отложенные папки) — следующий начнём с
+        # корня, паузы отложенных папок сохраняются. Бюджет времени — хвост сохраняем.
+        if not budget_hit:
+            queue_ = []
+        save()
+        if self.error is not None:
+            raise self.error
+        if budget_hit:
+            return EXIT_MORE
+        return EXIT_OK if self.imp.stats.done or self.imp.stats.counts["failed"] else EXIT_IDLE
 
-# Guard вместо прежнего безусловного write-test: проверка монтирования + проба
-# чтения/записи под таймаутом. Выполняется до любых mkdir под IMPORT_ROOT
-# (включая .done ниже) и до веток --metadata-backfill / архивов / loose.
-storage_guard
 
-mkdir -p "$IMPORT_ROOT/.done"
-if [[ "${1:-}" == "--metadata-backfill" ]]; then
-  metadata_backfill
-  exit 0
-fi
-# Рекурсивный поиск zip (включая вложенные папки с номерами), сортировка по пути.
-mapfile -t archives < <(timeout 120 find "$IMPORT_ROOT" -type f -iname '*.zip' ! -path "$IMPORT_ROOT/.done/*" ! -path "$IMPORT_ROOT/.tmp*" 2>/dev/null | sort)
-if (( ${#archives[@]} > 0 )); then
-  # Новые архивы имеют приоритет над большой очередью уже распакованных файлов.
-  process_archive "${archives[0]}"
-  prune_empty_import_dirs
-  exit 0
-fi
+def reporter(api: Api, stats: Stats) -> None:
+    while not STOP.wait(REPORT_EVERY):
+        api.report("running", f"импорт :: {stats.where} · {stats.rate_per_min():.0f}/мин", stats.done)
 
-process_loose_import
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--metadata-backfill":
+        os.execv("/usr/local/bin/archive-import-legacy", ["archive-import-legacy", *sys.argv[1:]])
+    if not DASHBOARD_URL or not TOKEN:
+        log("DASHBOARD_URL and NAS_SYNC_TOKEN are required")
+        return EXIT_FAIL
+    os.makedirs(STATE_DIR, exist_ok=True)
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+
+    api = Api(DASHBOARD_URL, TOKEN)
+    importer = Importer(api)
+    try:
+        storage_guard(api)
+        importer.recover()
+    except StorageDown:
+        return EXIT_FAIL
+
+    stats = importer.stats
+    threading.Thread(target=reporter, args=(api, stats), daemon=True).start()
+    log(f"walk started: root={IMPORT_ROOT} files_root={FILES_ROOT} parallel={PARALLEL}")
+    code = EXIT_FAIL
+    try:
+        code = Walker(importer).run()
+    except StorageDown as exc:
+        log(f"stopping: storage/service unavailable ({exc})")
+        api.report("error", "хранилище недоступно", stats.done)
+        code = EXIT_FAIL
+    except Fatal as exc:
+        log(f"stopping: {exc}")
+        api.report("error", str(exc), stats.done)
+        code = EXIT_FAIL
+    finally:
+        STOP.set()
+        importer.exif.close()
+        importer.failed.save()
+        write_json_atomic(SUMMARY_FILE, {
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "exit": code,
+            "counts": stats.counts, "ratePerMin": round(stats.rate_per_min(), 1),
+        })
+    log(f"walk finished: {stats.summary()} rate={stats.rate_per_min():.1f}/min exit={code}")
+    if code in (EXIT_OK, EXIT_IDLE):
+        api.report("idle", "waiting for Apple media", stats.done)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
