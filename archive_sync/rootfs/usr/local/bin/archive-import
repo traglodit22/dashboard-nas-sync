@@ -179,6 +179,9 @@ check_hash_existing() {
 
 HASH_VALUE=""
 
+# Файлов, обработанных за текущий прогон loose-обхода (для статуса без total).
+RUN_PROCESSED=0
+
 heartbeat() {
   local label="$1" done="$2" total="$3" pending="$4" stage="$5"
   while sleep 30; do
@@ -673,136 +676,171 @@ build_loose_dir_queue() {
   printf '%s\n' "$IMPORT_ROOT" > "$1"
 }
 
-# Листинг одной папки с таймаутом и фоновым heartbeat.
-scan_dir_media() {
-  local dir="$1" list="$2" hb rc
-  ( while sleep 45; do report running "loose files" 0 0 0 "scan $(basename "$dir")"; done ) &
-  hb=$!
-  if timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -maxdepth 1 -type f \( \
-    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
-    -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
-    -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
-    -o -iname '*.3gp' \
-  \) -print0 > "$list" 2>/dev/null; then
-    rc=0
-  else
-    rc=$?
+# Обработка одного loose-файла: хеш, дедуп, загрузка. Счётчики done/skipped/failed
+# берутся из вызывающей process_loose_dir (динамическая область видимости bash).
+process_loose_file() {
+  local file="$1"
+  local hash="" existing captured="" photos_meta=""
+  local csv_meta csv_favorite csv_keywords csv_people http_code file_dir file_base
+  if ! is_video "$file"; then
+    hash_with_heartbeat "$file" "loose files" "$RUN_PROCESSED" 0 0 || {
+      failed=$((failed + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+      log "hash failed/timeout: $(basename "$file")"
+      return 1
+    }
+    hash="$HASH_VALUE"
   fi
-  kill "$hb" 2>/dev/null || true
-  wait "$hb" 2>/dev/null || true
-  return $rc
-}
-
-# Перечисление подпапок одной папки с таймаутом и фоновым heartbeat.
-collect_subdirs() {
-  local dir="$1" out="$2" hb rc
-  ( while sleep 45; do report running "loose files" 0 0 0 "scan $(basename "$dir")"; done ) &
-  hb=$!
-  if timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -mindepth 1 -maxdepth 1 -type d \
-    ! -name '.done' ! -name '.tmp*' -print >> "$out" 2>/dev/null; then
-    rc=0
-  else
-    rc=$?
+  existing=""
+  check_hash_existing "$hash" || true
+  existing="$EXISTING_VALUE"
+  if [[ -n "$existing" ]]; then
+    csv_meta="$(csv_metadata_for "$file")"
+    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+    captured="${captured:-$(capture_date_for "$file")}"
+    photos_meta="$(photos_metadata_for "$file")"
+    if [[ -n "$photos_meta" || -n "$captured" ]]; then
+      send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+    fi
+    skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+    remove_loose_after_success "$file"
+    return 0
   fi
-  kill "$hb" 2>/dev/null || true
-  wait "$hb" 2>/dev/null || true
-  return $rc
+  csv_meta="$(csv_metadata_for "$file")"
+  IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
+  captured="${captured:-$(capture_date_for "$file")}"
+  photos_meta=""
+  if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
+    photos_meta="$(photos_metadata_for "$file")"
+  fi
+  file_dir="$(dirname "$file")"
+  file_base="$(basename "$file")"
+  if is_video "$file"; then
+    local stream_type="video/mp4"
+    [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
+    UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
+    [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
+    [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
+    UPLOAD_ENDPOINT="$STREAM_API"
+    # Битое/зависшее чтение видео не должно блокировать очередь на 15 мин.
+    UPLOAD_TIMEOUT="${IMPORT_VIDEO_UPLOAD_TIMEOUT_SECONDS:-180}"
+  else
+    local -a form_args=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
+    [[ -n "$captured" ]] && form_args+=(--form-string "capturedAt=$captured")
+    [[ -n "$hash" ]] && form_args+=(--form-string "contentHash=$hash")
+    [[ -n "$photos_meta" ]] && form_args+=(--form-string "photosMeta=$photos_meta")
+    UPLOAD_ARGS=("${form_args[@]}")
+    UPLOAD_ENDPOINT="$API"
+    UPLOAD_TIMEOUT="${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}"
+  fi
+  UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"
+  UPLOAD_DONE="$RUN_PROCESSED"; UPLOAD_TOTAL=0; UPLOAD_PENDING=0
+  upload_with_heartbeat || true
+  http_code="$UPLOAD_HTTP_CODE"
+  case "$http_code" in
+    200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
+    413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
+    503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
+    000)
+      if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
+        failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+      else
+        failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
+      fi ;;
+    *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
+  esac
+  RUN_PROCESSED=$((RUN_PROCESSED + 1))
+  return 0
 }
 
 process_loose_dir() {
   local dir="$1" subdirs_out="$2"
-  local file hash existing captured photos_meta
-  local list done=0 skipped=0 failed=0 total=0
-  list="$(mktemp)"
-  : > "$subdirs_out"
-  # Отчитываемся сразу: статус не должен «протухать» во время долгих листингов.
-  report running "loose files" 0 0 0 "scan $(basename "$dir")"
-  if ! scan_dir_media "$dir" "$list"; then
-    # Листинг медиа упал/таймаут — подпапки всё равно собираем, поддерево не теряем.
-    collect_subdirs "$dir" "$subdirs_out" || log "warning: cannot list subdirectories: $dir"
-    rm -f "$list"
-    log "dir scan failed/timeout: $dir"
+  local entry file deferred fifo hb_pid find_pid find_rc first read_rc stalled
+  local done=0 skipped=0 failed=0
+  deferred="$(mktemp "$IMPORT_STATE_DIR/.deferred.XXXXXX")"
+  fifo="$(mktemp "$IMPORT_STATE_DIR/.fifo.XXXXXX")"
+  rm -f "$fifo"
+  if ! mkfifo "$fifo"; then
+    rm -f "$deferred"
+    log "cannot create fifo for dir scan: $dir"
     return 1
   fi
-  while IFS= read -r -d '' file; do total=$((total + 1)); done < "$list"
-  # Сначала фото, видео — в конце: зависшее/битое видео не блокирует фото.
-  prioritize_media_list "$list"
-  while IFS= read -r -d '' file; do
-    is_media "$file" || continue
-    if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$file"; then
-      skipped=$((skipped + 1))
-      continue
-    fi
-    report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
-    hash=""; captured=""; photos_meta=""
-    if ! is_video "$file"; then
-      hash_with_heartbeat "$file" "loose files" $((done + skipped + failed)) "$total" 0 || {
-        failed=$((failed + 1)); log "hash failed/timeout: $(basename "$file")"; note_storage_failure; continue
-      }
-      hash="$HASH_VALUE"
-    fi
-    existing=""
-    check_hash_existing "$hash" || true
-    existing="$EXISTING_VALUE"
-    if [[ -n "$existing" ]]; then
-      local csv_meta csv_favorite csv_keywords csv_people
-      csv_meta="$(csv_metadata_for "$file")"
-      IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-      captured="${captured:-$(capture_date_for "$file")}"
-      photos_meta="$(photos_metadata_for "$file")"
-      if [[ -n "$photos_meta" || -n "$captured" ]]; then
-        send_metadata_for "$(basename "$file")" "$hash" "$captured" "$photos_meta"
+  : > "$subdirs_out"
+  report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"
+  # Heartbeat, пока листинг не отдал ни одной записи: статус не должен «протухать».
+  ( while sleep 45; do report running "loose files" "$RUN_PROCESSED" 0 0 "scan $(basename "$dir")"; done ) &
+  hb_pid=$!
+  first=1
+  # Один проход по каталогу; тип записи НЕ запрашиваем у хранилища (-type убран),
+  # файлы обрабатываются по мере поступления, подкаталоги собираются здесь же.
+  find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null > "$fifo" &
+  find_pid=$!
+  read_rc=0
+  while :; do
+    if IFS= read -r -d '' -t "$LOOSE_DIR_SCAN_TIMEOUT" entry <&3; then
+      if (( first )); then
+        kill "$hb_pid" 2>/dev/null || true
+        wait "$hb_pid" 2>/dev/null || true
+        first=0
       fi
-      skipped=$((skipped + 1))
-      remove_loose_after_success "$file"
-      continue
-    fi
-    local csv_meta csv_favorite csv_keywords csv_people http_code file_dir file_base
-    csv_meta="$(csv_metadata_for "$file")"
-    IFS=$'\t' read -r captured csv_favorite csv_keywords csv_people <<< "$csv_meta"
-    captured="${captured:-$(capture_date_for "$file")}"
-    file_dir="$(dirname "$file")"
-    file_base="$(basename "$file")"
-    local -a form_args=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
-    [[ -n "$captured" ]] && form_args+=(--form-string "capturedAt=$captured")
-    [[ -n "$hash" ]] && form_args+=(--form-string "contentHash=$hash")
-    if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
-      photos_meta="$(photos_metadata_for "$file")"
-      form_args+=(--form-string "photosMeta=$photos_meta")
-    fi
-    if is_video "$file"; then
-      local stream_type="video/mp4"
-      [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
-      UPLOAD_ARGS=(--upload-file "$file_base" -H "Content-Type: $stream_type" -H "X-File-Name: $file_base")
-      [[ -n "$captured" ]] && UPLOAD_ARGS+=(-H "X-Captured-At: $captured")
-      [[ -n "$photos_meta" ]] && UPLOAD_ARGS+=(-H "X-Photos-Meta: $photos_meta")
-      UPLOAD_ENDPOINT="$STREAM_API"
-      # Битое/зависшее чтение видео не должно блокировать очередь на 15 мин.
-      UPLOAD_TIMEOUT="${IMPORT_VIDEO_UPLOAD_TIMEOUT_SECONDS:-180}"
-    else
-      UPLOAD_ARGS=("${form_args[@]}")
-      UPLOAD_ENDPOINT="$API"
-      UPLOAD_TIMEOUT="${IMPORT_UPLOAD_TIMEOUT_SECONDS:-900}"
-    fi
-    UPLOAD_DIR="$file_dir"; UPLOAD_LABEL="loose files"; UPLOAD_FILE_NAME="$file_base"; UPLOAD_DONE=$((done + skipped + failed)); UPLOAD_TOTAL="$total"; UPLOAD_PENDING=0
-    upload_with_heartbeat || true
-    http_code="$UPLOAD_HTTP_CODE"
-    case "$http_code" in
-      200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
-      413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
-      503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
-      000)
-        if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
-          failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+      if is_media "$entry"; then
+        if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$entry"; then
+          skipped=$((skipped + 1)); RUN_PROCESSED=$((RUN_PROCESSED + 1))
+          continue
+        fi
+        if is_video "$entry"; then
+          # Видео откладываем: фото должны уйти раньше, не делая второй листинг.
+          printf '%s\0' "$entry" >> "$deferred"
         else
-          failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
-        fi ;;
-      *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
-    esac
-  done < "$list"
-  collect_subdirs "$dir" "$subdirs_out" || log "warning: cannot list subdirectories: $dir"
-  rm -f "$list"
-  log "dir done $(basename "$dir"): total=$total imported=$done skipped=$skipped failed=$failed"
+          report running "loose files" "$RUN_PROCESSED" 0 0 "$(basename "$entry")"
+          process_loose_file "$entry"
+        fi
+      elif [[ -d "$entry" ]]; then
+        # Служебные каталоги (.done, .tmp*) в очередь не ставим — как и прежде
+        # делал collect_subdirs: там лежат уже обработанные файлы и CSV.
+        case "$(basename "$entry")" in
+          .done|.tmp*) ;;
+          *) printf '%s\n' "$entry" >> "$subdirs_out" ;;
+        esac
+      fi
+    else
+      read_rc=$?
+      break
+    fi
+  done 3< "$fifo"
+  if (( first )); then
+    kill "$hb_pid" 2>/dev/null || true
+    wait "$hb_pid" 2>/dev/null || true
+  fi
+  # Сторож простоя: read -t отсчитывается только пока ждём следующую запись.
+  # 1 = EOF (find завершился), >128 = простой (данных не было дольше таймаута).
+  stalled=0
+  if (( read_rc > 128 )); then
+    stalled=1
+    log "dir scan stalled: $dir (no entries for ${LOOSE_DIR_SCAN_TIMEOUT}s)"
+  fi
+  if (( stalled )); then
+    # Мягко, затем принудительно после короткого грейс-периода.
+    kill "$find_pid" 2>/dev/null || true
+    sleep 5
+    kill -9 "$find_pid" 2>/dev/null || true
+  fi
+  if wait "$find_pid"; then find_rc=0; else find_rc=$?; fi
+  rm -f "$fifo"
+  # Отложенные видео — после фото этой папки.
+  if [[ -s "$deferred" ]]; then
+    while IFS= read -r -d '' file; do
+      [[ -e "$file" ]] || continue
+      process_loose_file "$file"
+    done < "$deferred"
+  fi
+  rm -f "$deferred"
+  if (( stalled )) || (( find_rc != 0 )); then
+    # Простой/ошибка листинга: подпапки уже частично собраны, обработанные файлы
+    # не откатываются. Каталог попадёт в счётчик попыток.
+    log "dir scan failed/timeout: $dir (stalled=$stalled find rc=$find_rc)"
+    return 1
+  fi
+  log "dir done $(basename "$dir"): imported=$done skipped=$skipped failed=$failed"
   return 0
 }
 
