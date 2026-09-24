@@ -202,6 +202,7 @@ hash_with_heartbeat() {
 }
 
 UPLOAD_HTTP_CODE="000"
+UPLOAD_CURL_RC=0
 UPLOAD_DIR=""
 UPLOAD_LABEL=""
 UPLOAD_DONE=0
@@ -228,6 +229,7 @@ upload_with_heartbeat() {
   wait "$heartbeat_pid" 2>/dev/null || true
   UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
   [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  UPLOAD_CURL_RC="$rc"
   rm -f "$result_file"
   return "$rc"
 }
@@ -257,6 +259,7 @@ upload_quiet() {
   ); then rc=0; else rc=$?; fi
   UPLOAD_HTTP_CODE="$(tail -c 3 "$result_file" 2>/dev/null || true)"
   [[ "$UPLOAD_HTTP_CODE" =~ ^[0-9]{3}$ ]] || UPLOAD_HTTP_CODE="000"
+  UPLOAD_CURL_RC="$rc"
   rm -f "$result_file"
   return "$rc"
 }
@@ -344,6 +347,15 @@ with open(path, 'wb') as handle:
     for item in files:
         handle.write(item + b'\0')
 PY
+}
+
+# Экранирование имени файла для curl -F "file=@\"...\"": внутри кавычек curl
+# понимает \\ и \", а , ; и ведущий @ становятся литеральными.
+curl_form_filename() {
+  local name="$1"
+  name="${name//\\/\\\\}"
+  name="${name//\"/\\\"}"
+  printf '%s' "$name"
 }
 
 build_csv_metadata() {
@@ -718,6 +730,7 @@ process_loose_dir() {
   while IFS= read -r -d '' file; do
     is_media "$file" || continue
     if [[ "${IMPORT_SKIP_VIDEOS:-false}" == "true" ]] && is_video "$file"; then
+      skipped=$((skipped + 1))
       continue
     fi
     report running "loose files" $((done + skipped + failed)) "$total" 0 "$(basename "$file")"
@@ -750,12 +763,12 @@ process_loose_dir() {
     captured="${captured:-$(capture_date_for "$file")}"
     file_dir="$(dirname "$file")"
     file_base="$(basename "$file")"
-    local -a form_args=(-F "file=@$file_base" -F "fileName=$file_base")
-    [[ -n "$captured" ]] && form_args+=(-F "capturedAt=$captured")
-    [[ -n "$hash" ]] && form_args+=(-F "contentHash=$hash")
+    local -a form_args=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
+    [[ -n "$captured" ]] && form_args+=(--form-string "capturedAt=$captured")
+    [[ -n "$hash" ]] && form_args+=(--form-string "contentHash=$hash")
     if [[ -n "$csv_favorite$csv_keywords$csv_people" ]]; then
       photos_meta="$(photos_metadata_for "$file")"
-      form_args+=(-F "photosMeta=$photos_meta")
+      form_args+=(--form-string "photosMeta=$photos_meta")
     fi
     if is_video "$file"; then
       local stream_type="video/mp4"
@@ -778,7 +791,12 @@ process_loose_dir() {
       200|201) done=$((done + 1)); reset_storage_failures; remove_loose_after_success "$file" ;;
       413) failed=$((failed + 1)); log "upload rejected (HTTP 413, file exceeds 10 GB): $file_base" ;;
       503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
-      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure ;;
+      000)
+        if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
+          failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+        else
+          failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
+        fi ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
   done < "$list"
@@ -953,11 +971,11 @@ process_archive() {
     log "uploading $(basename "$file") size=${file_size} bytes"
     file_dir="$(dirname "$file")"
     file_base="$(basename "$file")"
-    local -a archive_form=(-F "file=@$file_base" -F "fileName=$file_base")
-    [[ -n "$captured" ]] && archive_form+=(-F "capturedAt=$captured")
+    local -a archive_form=(-F "file=@\"$(curl_form_filename "$file_base")\"" --form-string "fileName=$file_base")
+    [[ -n "$captured" ]] && archive_form+=(--form-string "capturedAt=$captured")
     photos_meta="$(photos_metadata_for "$file")"
-    [[ -n "$photos_meta" ]] && archive_form+=(-F "photosMeta=$photos_meta")
-    [[ -n "$hash" ]] && archive_form+=(-F "contentHash=$hash")
+    [[ -n "$photos_meta" ]] && archive_form+=(--form-string "photosMeta=$photos_meta")
+    [[ -n "$hash" ]] && archive_form+=(--form-string "contentHash=$hash")
     if is_video "$file"; then
       local stream_type="video/mp4"
       [[ "$file_base" == *.MOV ]] && stream_type="video/quicktime"
@@ -976,7 +994,12 @@ process_archive() {
       200|201) done=$((done + 1)); reset_storage_failures ;;
       413) skipped=$((skipped + 1)); log "upload skipped (HTTP 413, file exceeds 10 GB): $file_base" ;;
       503) failed=$((failed + 1)); log "upload failed (HTTP 503, storage unavailable): $file_base"; note_storage_failure ;;
-      000) failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure ;;
+      000)
+        if [[ "$UPLOAD_CURL_RC" == "26" ]]; then
+          failed=$((failed + 1)); log "upload skipped (cannot read local file): $file_base"
+        else
+          failed=$((failed + 1)); log "upload failed (network/timeout): $file_base"; note_storage_failure
+        fi ;;
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
     update_state "$(basename "$archive")" "$done" "$skipped" "$failed"
