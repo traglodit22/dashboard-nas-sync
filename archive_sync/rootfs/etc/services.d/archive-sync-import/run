@@ -13,6 +13,7 @@ mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
 import_probe_timeout="$(jq -r '.import_storage_probe_timeout_seconds // 30' "$options")"
 import_fail_limit="$(jq -r '.import_storage_fail_limit // 3' "$options")"
 retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
+import_dir_scan_timeout="$(jq -r '.import_dir_scan_timeout_seconds // 180' "$options")"
 
 if [[ "$import_enabled" != "true" ]]; then
   echo "[import] disabled (import_enabled != true)"
@@ -29,6 +30,7 @@ export IMPORT_DONE_RETENTION_DAYS="$done_retention_days"
 export MOUNT_CHECK_ENABLED="$mount_check_enabled"
 export IMPORT_STORAGE_PROBE_TIMEOUT_SECONDS="$import_probe_timeout"
 export IMPORT_STORAGE_FAIL_LIMIT="$import_fail_limit"
+export IMPORT_DIR_SCAN_TIMEOUT="$import_dir_scan_timeout"
 export IMPORT_STATE_FILE="/data/import-state.json"
 
 read_token() {

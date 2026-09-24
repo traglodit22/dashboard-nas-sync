@@ -647,6 +647,10 @@ find_next_loose_media() {
 # Скан папки ограничен таймаутом; упавшая папка возвращается в конец очереди.
 
 LOOSE_DIR_SCAN_TIMEOUT="${IMPORT_DIR_SCAN_TIMEOUT:-180}"
+# Значение из окружения принимаем только как целое > 0; иначе — безопасное 180.
+if ! [[ "$LOOSE_DIR_SCAN_TIMEOUT" =~ ^[0-9]+$ ]] || (( LOOSE_DIR_SCAN_TIMEOUT <= 0 )); then
+  LOOSE_DIR_SCAN_TIMEOUT=180
+fi
 # 0 = без ограничения по числу папок (ограничиваем только временем прогона).
 LOOSE_DIR_BUDGET="${IMPORT_DIR_BUDGET:-0}"
 # Максимальная длительность одного прогона обхода, секунды (0 = без лимита).
@@ -662,7 +666,7 @@ scan_dir_media() {
   local dir="$1" list="$2" hb rc
   ( while sleep 45; do report running "loose files" 0 0 0 "scan $(basename "$dir")"; done ) &
   hb=$!
-  if timeout "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -maxdepth 1 -type f \( \
+  if timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -maxdepth 1 -type f \( \
     -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \
     -o -iname '*.heif' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.tiff' \
     -o -iname '*.tif' -o -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \
@@ -682,6 +686,12 @@ process_loose_dir() {
   local file hash existing captured photos_meta
   local list done=0 skipped=0 failed=0 total=0
   list="$(mktemp)"
+  # Подпапки собираем до листинга медиа: таймаут листинга не должен терять поддерево.
+  : > "$subdirs_out"
+  if ! timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.done' ! -name '.tmp*' -print >> "$subdirs_out" 2>/dev/null; then
+    log "warning: cannot list subdirectories: $dir"
+  fi
   report running "loose files" 0 0 0 "scan $(basename "$dir")"
   if ! scan_dir_media "$dir" "$list"; then
     rm -f "$list"
@@ -759,12 +769,6 @@ process_loose_dir() {
     esac
   done < "$list"
   rm -f "$list"
-  # Подпапки этого каталога дописываем в очередь: обход доходит до любого уровня.
-  : > "$subdirs_out"
-  if ! find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.done' ! -name '.tmp*' \
-    -print >> "$subdirs_out" 2>/dev/null; then
-    log "warning: cannot list subdirectories: $dir"
-  fi
   log "dir done $(basename "$dir"): total=$total imported=$done skipped=$skipped failed=$failed"
   return 0
 }
@@ -805,13 +809,17 @@ process_loose_import() {
     head=$((head + 1))
     n=$((n + 1))
     [[ -d "$dir" ]] || continue
-    if process_loose_dir "$dir" "$sub_tmp"; then
-      if [[ -s "$sub_tmp" ]]; then
-        while IFS= read -r sub; do
-          [[ -n "$sub" ]] || continue
-          queue+=("$sub")
-        done < "$sub_tmp"
-      fi
+    local rc=0
+    if process_loose_dir "$dir" "$sub_tmp"; then rc=0; else rc=$?; fi
+    # Подпапки добавляем в очередь независимо от успеха папки: таймаут
+    # листинга не должен отрезать всё поддерево от обхода.
+    if [[ -s "$sub_tmp" ]]; then
+      while IFS= read -r sub; do
+        [[ -n "$sub" ]] || continue
+        queue+=("$sub")
+      done < "$sub_tmp"
+    fi
+    if (( rc == 0 )); then
       if [[ -f "$tries" ]]; then
         grep -vF -- "$dir" "$tries" > "$tries.tmp" 2>/dev/null && mv "$tries.tmp" "$tries" || rm -f "$tries.tmp"
       fi
