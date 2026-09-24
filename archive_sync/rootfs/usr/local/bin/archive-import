@@ -467,10 +467,27 @@ def filename_date(name: str) -> str | None:
     return f"{y}-{mo}-{d}T{h}:{mi}:{s or '00'}"
 
 
+# Экспорт iCloud (privacy.apple.com): "Tuesday December 15,2020 5:24 PM GMT".
+ICLOUD_DATE = re.compile(
+    r"^(?:[A-Za-z]+\s+)?([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)\s*(?:GMT|UTC)?$",
+    re.I,
+)
+
+
 def parse_csv_date(value: str) -> str | None:
     value = value.strip()
     if not value:
         return None
+    match = ICLOUD_DATE.match(value)
+    if match:
+        month, day, year, hour, minute, second, ampm = match.groups()
+        try:
+            parsed = dt.datetime.strptime(
+                f"{month[:3]} {day} {year} {hour}:{minute}:{second or '00'} {ampm.upper()}", "%b %d %Y %I:%M:%S %p"
+            )
+            return parsed.replace(tzinfo=dt.timezone.utc).isoformat()
+        except ValueError:
+            return None
     if value.isdigit():
         try:
             return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat()
@@ -495,7 +512,16 @@ def parse_csv_date(value: str) -> str | None:
 
 
 def load_csv_metadata(root: str) -> dict:
-    """CSV из экспорта Apple (Photo Details*.csv) → {имя файла: метаданные}; читается один раз."""
+    """CSV из экспорта Apple (Photo Details*.csv) во всём дереве → {имя файла: метаданные}."""
+    paths = []
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        paths += [os.path.join(current, f) for f in files if f.lower().endswith(".csv")]
+    return load_csv_files(paths)
+
+
+def load_csv_files(paths: list) -> dict:
+    """CSV-файлы → {имя файла: метаданные}; каждый читается один раз."""
 
     def norm(value: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
@@ -504,53 +530,50 @@ def load_csv_metadata(root: str) -> dict:
         return next((field for field, key in fields if pred(key)), None)
 
     rows: dict = {}
-    for current, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for filename in files:
-            if not filename.lower().endswith(".csv"):
-                continue
-            try:
-                with open(os.path.join(current, filename), "r", encoding="utf-8-sig", newline="") as handle:
-                    reader = csv.DictReader(handle)
-                    if not reader.fieldnames:
+    for csv_path in paths:
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames:
+                    continue
+                fields = [(f, norm(f)) for f in reader.fieldnames if f]
+                name_f = pick(fields, lambda k: any(w in k for w in (
+                    "filename", "file name", "original filename", "original name", "media name", "imgname", "img name",
+                    "image name")))
+                date_f = (
+                    pick(fields, lambda k: k in ("date taken", "photo taken", "capture date", "creation date",
+                                                 "created date", "date"))
+                    or pick(fields, lambda k: any(w in k for w in ("captured", "taken", "created", "creation")))
+                    or pick(fields, lambda k: k in ("time", "capture time"))
+                )
+                time_f = pick(fields, lambda k: k in ("time", "capture time"))
+                fav_f = pick(fields, lambda k: any(w in k for w in ("favorite", "is favorite", "favourite")))
+                kw_f = pick(fields, lambda k: any(w in k for w in ("keywords", "keyword", "tags", "tag")))
+                ppl_f = pick(fields, lambda k: any(w in k for w in ("people", "person", "faces", "face names")))
+                if not name_f or not date_f:
+                    continue
+                for row in reader:
+                    name = os.path.basename((row.get(name_f) or "").strip())
+                    time_value = (row.get(time_f) or "").strip() if time_f and time_f != date_f else ""
+                    date = parse_csv_date(f"{(row.get(date_f) or '').strip()} {time_value}".strip())
+                    if not name or not date:
                         continue
-                    fields = [(f, norm(f)) for f in reader.fieldnames if f]
-                    name_f = pick(fields, lambda k: any(w in k for w in (
-                        "filename", "file name", "original filename", "original name", "media name")))
-                    date_f = (
-                        pick(fields, lambda k: k in ("date taken", "photo taken", "capture date", "creation date",
-                                                     "created date", "date"))
-                        or pick(fields, lambda k: any(w in k for w in ("captured", "taken", "created", "creation")))
-                        or pick(fields, lambda k: k in ("time", "capture time"))
-                    )
-                    time_f = pick(fields, lambda k: k in ("time", "capture time"))
-                    fav_f = pick(fields, lambda k: any(w in k for w in ("favorite", "is favorite", "favourite")))
-                    kw_f = pick(fields, lambda k: any(w in k for w in ("keywords", "keyword", "tags", "tag")))
-                    ppl_f = pick(fields, lambda k: any(w in k for w in ("people", "person", "faces", "face names")))
-                    if not name_f or not date_f:
-                        continue
-                    for row in reader:
-                        name = os.path.basename((row.get(name_f) or "").strip())
-                        time_value = (row.get(time_f) or "").strip() if time_f and time_f != date_f else ""
-                        date = parse_csv_date(f"{(row.get(date_f) or '').strip()} {time_value}".strip())
-                        if not name or not date:
-                            continue
-                        favorite = (row.get(fav_f) or "").strip().lower() if fav_f else ""
-                        meta: dict = {"date": date}
-                        if favorite in ("yes", "true", "1", "y", "да"):
-                            meta["favorite"] = True
-                        elif favorite in ("no", "false", "0", "n", "нет"):
-                            meta["favorite"] = False
-                        keywords = (row.get(kw_f) or "").strip() if kw_f else ""
-                        people = (row.get(ppl_f) or "").strip() if ppl_f else ""
-                        if keywords:
-                            meta["keywords"] = [x.strip() for x in keywords.replace(";", ",").split(",") if x.strip()]
-                        if people:
-                            meta["people"] = [{"name": x.strip()} for x in people.replace(";", ",").split(",")
-                                              if x.strip()]
-                        rows[name] = meta
-            except (OSError, UnicodeError, csv.Error):
-                continue
+                    favorite = (row.get(fav_f) or "").strip().lower() if fav_f else ""
+                    meta: dict = {"date": date}
+                    if favorite in ("yes", "true", "1", "y", "да"):
+                        meta["favorite"] = True
+                    elif favorite in ("no", "false", "0", "n", "нет"):
+                        meta["favorite"] = False
+                    keywords = (row.get(kw_f) or "").strip() if kw_f else ""
+                    people = (row.get(ppl_f) or "").strip() if ppl_f else ""
+                    if keywords:
+                        meta["keywords"] = [x.strip() for x in keywords.replace(";", ",").split(",") if x.strip()]
+                    if people:
+                        meta["people"] = [{"name": x.strip()} for x in people.replace(";", ",").split(",")
+                                          if x.strip()]
+                    rows[name] = meta
+        except (OSError, UnicodeError, csv.Error):
+            continue
     return rows
 
 
@@ -816,7 +839,7 @@ class Walker:
     def scan_dir(self, path: str, csv_meta: dict | None):
         """Файлы в работу сразу по мере листинга; видео — после фото папки; архивы — после."""
         self.imp.stats.where = self.rel(path)
-        subdirs, videos, archives, futures = [], [], [], []
+        subdirs, videos, archives, csvs, futures = [], [], [], [], []
         for full, name, is_dir in iter_dir(path, DIR_TIMEOUT):
             if STOP.is_set():
                 break
@@ -828,11 +851,19 @@ class Walker:
             ext = os.path.splitext(name)[1].lower()
             if ext == ".zip":
                 archives.append(full)
+            elif ext == ".csv":
+                csvs.append(full)
             elif ext in VIDEO_EXT:
-                if not SKIP_VIDEOS:
+                if SKIP_VIDEOS:
+                    self.imp.stats.add("skipped_video")
+                else:
                     videos.append(full)
             elif ext in PHOTO_EXT:
                 futures.append(self.submit(full, csv_meta))
+        if videos and csvs:
+            # Экспорт iCloud кладёт Photo Details*.csv рядом с медиа; для видео это
+            # самый надёжный источник даты. К этому моменту листинг папки завершён.
+            csv_meta = {**load_csv_files(csvs), **(csv_meta or {})}
         for video in videos:
             if STOP.is_set():
                 break
@@ -1007,7 +1038,12 @@ def main() -> int:
         })
     log(f"walk finished: {stats.summary()} rate={stats.rate_per_min():.1f}/min exit={code}")
     if code in (EXIT_OK, EXIT_IDLE):
-        api.report("idle", "waiting for Apple media", stats.done)
+        skipped_videos = stats.counts.get("skipped_video", 0)
+        label = "waiting for Apple media"
+        if skipped_videos:
+            label = f"пропущено видео: {skipped_videos} (import_skip_videos включён)"
+            log(f"{skipped_videos} videos left in place because import_skip_videos=true")
+        api.report("idle", label, stats.done)
     return code
 
 
