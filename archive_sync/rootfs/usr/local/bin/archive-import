@@ -681,19 +681,33 @@ scan_dir_media() {
   return $rc
 }
 
+# Перечисление подпапок одной папки с таймаутом и фоновым heartbeat.
+collect_subdirs() {
+  local dir="$1" out="$2" hb rc
+  ( while sleep 45; do report running "loose files" 0 0 0 "scan $(basename "$dir")"; done ) &
+  hb=$!
+  if timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -mindepth 1 -maxdepth 1 -type d \
+    ! -name '.done' ! -name '.tmp*' -print >> "$out" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  kill "$hb" 2>/dev/null || true
+  wait "$hb" 2>/dev/null || true
+  return $rc
+}
+
 process_loose_dir() {
   local dir="$1" subdirs_out="$2"
   local file hash existing captured photos_meta
   local list done=0 skipped=0 failed=0 total=0
   list="$(mktemp)"
-  # Подпапки собираем до листинга медиа: таймаут листинга не должен терять поддерево.
   : > "$subdirs_out"
-  if ! timeout -k 5 "$LOOSE_DIR_SCAN_TIMEOUT" find "$dir" -mindepth 1 -maxdepth 1 -type d \
-    ! -name '.done' ! -name '.tmp*' -print >> "$subdirs_out" 2>/dev/null; then
-    log "warning: cannot list subdirectories: $dir"
-  fi
+  # Отчитываемся сразу: статус не должен «протухать» во время долгих листингов.
   report running "loose files" 0 0 0 "scan $(basename "$dir")"
   if ! scan_dir_media "$dir" "$list"; then
+    # Листинг медиа упал/таймаут — подпапки всё равно собираем, поддерево не теряем.
+    collect_subdirs "$dir" "$subdirs_out" || log "warning: cannot list subdirectories: $dir"
     rm -f "$list"
     log "dir scan failed/timeout: $dir"
     return 1
@@ -768,6 +782,7 @@ process_loose_dir() {
       *) failed=$((failed + 1)); log "upload failed (HTTP $http_code): $file_base" ;;
     esac
   done < "$list"
+  collect_subdirs "$dir" "$subdirs_out" || log "warning: cannot list subdirectories: $dir"
   rm -f "$list"
   log "dir done $(basename "$dir"): total=$total imported=$done skipped=$skipped failed=$failed"
   return 0
@@ -789,7 +804,15 @@ process_loose_import() {
   # Очередь держим в памяти (O(1) на элемент), подпапки дописываем по ходу.
   local -a queue=()
   mapfile -t queue < "$q"
-  local head=0 n=0 start now dir cnt sub
+  local head=0 n=0 start now dir cnt sub d
+  local -A seen=()
+  # Дедуплицируем очередь: прежние версии могли оставить хвост с дублями.
+  if (( ${#queue[@]} > 0 )); then
+    mapfile -t queue < <(printf '%s\n' "${queue[@]}" | sort -u)
+  fi
+  for d in ${queue[@]+"${queue[@]}"}; do
+    [[ -n "$d" ]] && seen["$d"]=1
+  done
   start="$(date +%s)"
   sub_tmp="$(mktemp "$IMPORT_STATE_DIR/.subdirs.XXXXXX")"
 
@@ -816,7 +839,10 @@ process_loose_import() {
     if [[ -s "$sub_tmp" ]]; then
       while IFS= read -r sub; do
         [[ -n "$sub" ]] || continue
-        queue+=("$sub")
+        if [[ -z "${seen[$sub]:-}" ]]; then
+          seen["$sub"]=1
+          queue+=("$sub")
+        fi
       done < "$sub_tmp"
     fi
     if (( rc == 0 )); then
@@ -846,7 +872,7 @@ process_loose_import() {
   # Сохраняем необработанный хвост очереди для следующего прогона.
   : > "$q"
   if (( head < ${#queue[@]} )); then
-    printf '%s\n' "${queue[@]:head}" >> "$q"
+    printf '%s\n' "${queue[@]:head}" | sort -u >> "$q"
   else
     log "loose walk complete: no directories left"
     report idle "waiting for Apple media" 0 0 0
