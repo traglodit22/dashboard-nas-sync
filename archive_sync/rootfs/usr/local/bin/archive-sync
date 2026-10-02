@@ -107,12 +107,13 @@ while true; do
     [[ -n "$run_id$role$key$relative_path$download_url" ]] || continue
     destination="$NAS_BACKUP_ROOT/$relative_path"
     mkdir -p "$(dirname "$destination")"
-    # Висячие временные файлы прерванных загрузок (только свой паттерн,
-    # готовые архивы не трогаем) убираем до начала скачивания.
-    rm -f -- "$(dirname "$destination")"/*.archive-sync.tmp.* 2>/dev/null || true
-    temporary="${destination}.archive-sync.tmp.$$"
+    # Постоянное имя временного файла: оборванная загрузка (сервер рвёт длинные
+    # ответы ~через 5 мин) продолжается с места обрыва, а не с нуля — иначе файл
+    # больше ~1 ГБ не докачивается никогда. Старые временные файлы с PID в имени убираем.
+    temporary="${destination}.archive-sync.part"
+    rm -f -- "${destination}".archive-sync.tmp.* 2>/dev/null || true
     if curl --fail --silent --show-error --location --connect-timeout 30 \
-      --speed-time 300 --speed-limit 102400 --retry 2 --retry-delay 5 \
+      --speed-time 300 --speed-limit 102400 --retry 8 --retry-delay 5 --retry-all-errors \
       --continue-at - "$download_url" --output "$temporary"; then
       actual_size="$(stat -c '%s' "$temporary")"
       [[ "$actual_size" == "$size_bytes" ]] || { rm -f "$temporary"; continue; }
