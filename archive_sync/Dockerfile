@@ -2,7 +2,7 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 RUN apk add --no-cache bash curl jq coreutils python3 openssh-client unzip exiftool \
-    ffmpeg vips-tools vips-heif
+    ffmpeg vips-tools vips-heif libheif-tools
 
 COPY rootfs /
 RUN chmod 755 /etc/services.d/archive-sync/run \

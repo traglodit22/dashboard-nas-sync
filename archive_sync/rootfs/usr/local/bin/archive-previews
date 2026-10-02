@@ -73,11 +73,37 @@ def photo_preview(path: str) -> bytes:
         src = os.path.join(tmp, "src" + os.path.splitext(path)[1].lower())
         shutil.copyfile(path, src)
         out = os.path.join(tmp, "p.webp")
-        res = run(["vipsthumbnail", src, "--size", f"{PREVIEW_PX}x{PREVIEW_PX}", "-o", f"{out}[Q={QUALITY}]"])
+        res = thumbnail(src, out)
+        if (res.returncode != 0 or not os.path.exists(out)) and src.endswith((".heic", ".heif")):
+            # vips из базового образа не всегда открывает HEIC с iPhone — через heif-convert в JPEG.
+            first_error = res.stderr.decode(errors="replace").strip()
+            jpg = os.path.join(tmp, "src.jpg")
+            conv = run(["heif-convert", "-q", "90", src, jpg])
+            if conv.returncode == 0 and os.path.exists(jpg):
+                res = thumbnail(jpg, out)
+            else:
+                note_error("heif-convert", conv.stderr.decode(errors="replace") or first_error)
         if res.returncode != 0 or not os.path.exists(out):
-            raise RuntimeError(f"vipsthumbnail: {res.stderr.decode(errors='replace')[:200]}")
+            err = res.stderr.decode(errors="replace").strip()
+            note_error("vipsthumbnail", err)
+            raise RuntimeError(f"vipsthumbnail: {err[-300:]}")
         with open(out, "rb") as fh:
             return fh.read()
+
+
+def thumbnail(src: str, out: str) -> subprocess.CompletedProcess:
+    return run(["vipsthumbnail", src, "--size", f"{PREVIEW_PX}x{PREVIEW_PX}", "-o", f"{out}[Q={QUALITY}]"])
+
+
+_logged: set[str] = set()
+
+
+def note_error(tool: str, stderr: str) -> None:
+    """Первую ошибку каждого инструмента — целиком в журнал add-on (для разбора)."""
+    if tool in _logged:
+        return
+    _logged.add(tool)
+    log(f"{tool} error (first): {stderr.strip()[:1500]}")
 
 
 def video_probe(path: str) -> tuple[float | None, str | None]:
