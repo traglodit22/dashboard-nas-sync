@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.11.1"
+version: "0.12.0"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -50,6 +50,8 @@ options:
   import_storage_probe_timeout_seconds: 30
   import_storage_fail_limit: 3
   import_dir_scan_timeout_seconds: 180
+  previews_enabled: false
+  previews_parallel: 4
 schema:
   service_url: str
   token_file: str
@@ -81,3 +83,5 @@ schema:
   import_storage_probe_timeout_seconds: int(5,600)
   import_storage_fail_limit: int(1,100)
   import_dir_scan_timeout_seconds: int(30,3600)
+  previews_enabled: bool
+  previews_parallel: int(1,8)

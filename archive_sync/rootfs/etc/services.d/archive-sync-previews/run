@@ -1,0 +1,36 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+options=/data/options.json
+service_url="$(jq -r '.service_url' "$options")"
+token_file="$(jq -r '.token_file' "$options")"
+previews_enabled="$(jq -r '.previews_enabled // false' "$options")"
+previews_parallel="$(jq -r '.previews_parallel // 4' "$options")"
+retry_delay="$(jq -r '.retry_delay_seconds' "$options")"
+files_root="$(jq -r '.files_root // "/share/NAS"' "$options")"
+
+if [[ "$previews_enabled" != "true" ]]; then
+  echo "[previews] disabled (previews_enabled != true)"
+  exec sleep infinity
+fi
+
+echo "[previews] service started: parallel=$previews_parallel root=$files_root"
+export DASHBOARD_URL="$service_url"
+export FILES_ROOT="$files_root"
+export PREVIEWS_PARALLEL="$previews_parallel"
+
+while true; do
+  if [[ ! -s "$token_file" || -z "$service_url" ]]; then
+    echo "[previews] service URL or token file is missing"
+    sleep "$retry_delay"
+    continue
+  fi
+  export NAS_SYNC_TOKEN="$(tr -d '\r\n' < "$token_file")"
+  code=0
+  /usr/local/bin/archive-previews || code=$?
+  case "$code" in
+    0) ;;  # пачка обработана — сразу следующая
+    4) sleep 900 ;;  # очередь пуста
+    *) sleep "$retry_delay" ;;
+  esac
+done
