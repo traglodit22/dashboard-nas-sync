@@ -647,7 +647,8 @@ class Importer:
             return "skipped"
         key = f"{path}|{st.st_size}|{int(st.st_mtime)}"
         if self.failed.should_skip(key):
-            return "skipped"
+            # Пауза после неудачи — файл НЕ обработан (архив с ним удалять нельзя).
+            return "deferred"
         try:
             content_hash = sha256_file(path)
         except OSError as exc:
@@ -836,8 +837,13 @@ class Walker:
     def wait(self, futures) -> None:
         concurrent.futures.wait(list(futures))
 
-    def scan_dir(self, path: str, csv_meta: dict | None):
-        """Файлы в работу сразу по мере листинга; видео — после фото папки; архивы — после."""
+    def scan_dir(self, path: str, csv_meta: dict | None, leftovers: list | None = None):
+        """Файлы в работу сразу по мере листинга; видео — после фото папки; архивы — после.
+
+        leftovers — сюда складываются файлы, которые импорт не берёт (видео при
+        import_skip_videos, незнакомые типы): из распакованного архива их нельзя
+        удалять вместе с ним.
+        """
         self.imp.stats.where = self.rel(path)
         subdirs, videos, archives, csvs, futures = [], [], [], [], []
         for full, name, is_dir in iter_dir(path, DIR_TIMEOUT):
@@ -856,10 +862,14 @@ class Walker:
             elif ext in VIDEO_EXT:
                 if SKIP_VIDEOS:
                     self.imp.stats.add("skipped_video")
+                    if leftovers is not None:
+                        leftovers.append(full)
                 else:
                     videos.append(full)
             elif ext in PHOTO_EXT:
                 futures.append(self.submit(full, csv_meta))
+            elif leftovers is not None:
+                leftovers.append(full)
         if videos and csvs:
             # Экспорт iCloud кладёт Photo Details*.csv рядом с медиа; для видео это
             # самый надёжный источник даты. К этому моменту листинг папки завершён.
@@ -870,13 +880,13 @@ class Walker:
             futures.append(self.submit(video, csv_meta))
         return subdirs, archives, futures
 
-    def walk_tree(self, root: str, csv_meta: dict | None) -> int:
-        """Полный обход поддерева (для распакованного архива). → число неудачных файлов."""
+    def walk_tree(self, root: str, csv_meta: dict | None, leftovers: list) -> int:
+        """Полный обход поддерева (для распакованного архива). → число необработанных файлов."""
         stack, futures, stalled = [root], [], 0
         while stack and not STOP.is_set():
             current = stack.pop()
             try:
-                subdirs, archives, found = self.scan_dir(current, csv_meta)
+                subdirs, archives, found = self.scan_dir(current, csv_meta, leftovers)
             except (ListingStalled, OSError) as exc:
                 log(f"archive dir scan failed: {current}: {exc}")
                 stalled += 1
@@ -886,8 +896,35 @@ class Walker:
             for archive in archives:  # архив в архиве — как обычный
                 self.process_archive(archive)
         self.wait(futures)
-        failed = sum(1 for f in futures if f.cancelled() or f.exception() or f.result() in ("failed", "busy"))
+        failed = sum(
+            1 for f in futures
+            if f.cancelled() or f.exception() or f.result() in ("failed", "busy", "deferred")
+        )
         return failed + stalled
+
+    def keep_leftovers(self, work: str, name: str, leftovers: list) -> bool:
+        """Переносит неимпортируемые файлы из распаковки в «<архив> (не импортировано)»
+        рядом с архивами, сохраняя пути. → False, если хоть один не перенесён."""
+        stem = os.path.splitext(name)[0]
+        dest_root = os.path.join(IMPORT_ROOT, f"{stem} (не импортировано)")
+        n = 2
+        while os.path.exists(dest_root):
+            dest_root = os.path.join(IMPORT_ROOT, f"{stem} (не импортировано {n})")
+            n += 1
+        ok = True
+        for src in leftovers:
+            if not os.path.exists(src):
+                continue  # уже перенесён/обработан
+            dst = os.path.join(dest_root, os.path.relpath(src, work))
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.rename(src, dst)  # тот же том (IMPORT_ROOT) — атомарно
+            except OSError as exc:
+                log(f"keep leftover failed {src}: {exc}")
+                ok = False
+        if leftovers:
+            log(f"{len(leftovers)} file(s) from {name} kept in {os.path.basename(dest_root)}")
+        return ok
 
     def process_archive(self, archive: str) -> None:
         name = os.path.basename(archive)
@@ -913,8 +950,13 @@ class Walker:
                 self.imp.failed.note(f"{archive}|zip")
                 return
         csv_meta = load_csv_metadata(work)
-        failed = self.walk_tree(work, csv_meta)
+        leftovers: list = []
+        failed = self.walk_tree(work, csv_meta, leftovers)
         if failed == 0 and not STOP.is_set():
+            # Пропущенные видео и незнакомые файлы — не повод терять их вместе с архивом.
+            if not self.keep_leftovers(work, name, leftovers):
+                log(f"archive kept: {name} (не все неимпортируемые файлы перенесены)")
+                return
             os.remove(archive)
             shutil.rmtree(work, ignore_errors=True)
             log(f"archive done: {name}")
