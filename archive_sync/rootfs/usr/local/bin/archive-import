@@ -39,7 +39,8 @@ import zipfile
 
 EXIT_OK, EXIT_FAIL, EXIT_MORE, EXIT_IDLE = 0, 1, 3, 4
 
-PHOTO_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp", ".tiff", ".tif"}
+# TIFF — рабочие файлы обработки (0,5–1 ГБ): сервер их в галерею не берёт, остаются на диске.
+PHOTO_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp"}
 VIDEO_EXT = {".mov", ".mp4", ".m4v", ".3gp"}
 MEDIA_EXT = PHOTO_EXT | VIDEO_EXT
 HASH_CHUNK = 1024 * 1024
