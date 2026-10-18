@@ -37,6 +37,7 @@ DEST_DIR = "NAS"
 VERSIONS_DIR = "_versions"
 DAY = 86400
 STATS_TTL = 20 * 3600  # «раз в сутки»: прогоны идут раз в окно, кэш гасит только повторы по коду 3
+DU_TTL = 7 * 24 * 3600  # du по SMB обходит каждый файл (галерея — до часа); размеры нужны только для «осталось»
 CLEANUP_EVERY = 7 * DAY
 KEEP_ERRORS = 20
 ERROR_CHARS = 300
@@ -486,9 +487,9 @@ def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) 
 
 
 def refresh_du(state: dict, names: list[str], force: bool = False) -> dict:
-    """Размеры верхних папок — раз в сутки, кэш в /data."""
+    """Размеры верхних папок — раз в неделю, кэш в /data."""
     cache = state.get("du") or {}
-    if not force and time.time() - float(cache.get("ts") or 0) < STATS_TTL and all(n in (cache.get("dirs") or {}) for n in names):
+    if not force and time.time() - float(cache.get("ts") or 0) < DU_TTL and all(n in (cache.get("dirs") or {}) for n in names):
         return cache["dirs"]
     sizes = {}
     for name in names:
