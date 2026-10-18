@@ -607,6 +607,13 @@ def main() -> int:
             sections = config_sections(RCLONE_CONFIG)
         except OSError as exc:
             return finish(report, "error", f"cannot read rclone config: {exc.strerror}", EXIT_UNAVAILABLE)
+    # Диагностика без секретов: какой файл читаем и какие секции (только имена) в нём есть.
+    if not os.path.isfile(RCLONE_CONFIG):
+        log(f"rclone config {RCLONE_CONFIG}: файл не найден (опция gdrive_rclone_config)")
+    else:
+        found = [r for r in REMOTES if r in sections]
+        log(f"rclone config {RCLONE_CONFIG}: секции {', '.join(sorted(sections)) or 'нет'}; "
+            f"Google: {', '.join(found) or 'нет ни gdrive1, ни gdrive2'}")
     needed = sorted({p["remote"] for p in plan})
     missing = [r for r in needed if r not in sections]
     if plan and (not os.path.isfile(RCLONE_CONFIG) or missing):
