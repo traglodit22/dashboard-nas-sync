@@ -364,23 +364,32 @@ def version_subdir(started: dt.datetime, run_id: str) -> str:
     return f"{started:%Y-%m-%d}/{started:%H%M%S}-{run_id.replace('-', '')[:6]}"
 
 
-def count_pending_deletes(remote: str, filter_file: str, versions: str, timeout: int) -> int | None:
+def count_pending_deletes(remote: str, filter_file: str, versions: str,
+                          timeout: int) -> tuple[int | None, LogSummary]:
     """Сколько файлов sync уберёт из NAS/ (удалит или перенесёт в _versions) — пробным `--dry-run`.
     --max-delete сам по себе не спасает: rclone успевает перенести первые N файлов и только потом
-    падает. Поэтому считаем заранее и при превышении не запускаем sync вовсе. None — посчитать не удалось."""
+    падает. Поэтому считаем заранее и при превышении не запускаем sync вовсе. None — посчитать не удалось;
+    тогда в LogSummary ошибки пробного прогона (classify отличит отказ авторизации от прочего)."""
     cmd = ["rclone", "--config", RCLONE_CONFIG, "sync", FILES_ROOT, f"{remote}:{DEST_DIR}",
            "--filter-from", filter_file, "--backup-dir", f"{remote}:{VERSIONS_DIR}/{versions}",
            "--dry-run", "--fast-list", "--checkers", "8", "--use-json-log", "--log-level", "NOTICE"]
+    summary = LogSummary()
     try:
         res = subprocess.run(niced(cmd), capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
+        summary.errors.append(f"dry-run: {exc}"[:ERROR_CHARS])
         log(f"{remote}: dry-run failed: {exc}")
-        return None
+        return None, summary
+    lines = (res.stderr.decode("utf-8", errors="replace").splitlines()
+             + res.stdout.decode("utf-8", errors="replace").splitlines())
     if res.returncode != 0:
-        log(f"{remote}: dry-run exit={res.returncode}")
-        return None
-    return count_dry_run_removals(res.stderr.decode("utf-8", errors="replace").splitlines()
-                                  + res.stdout.decode("utf-8", errors="replace").splitlines())
+        for line in lines:
+            summary.feed(line)
+        if not summary.errors:
+            summary.errors.append(f"dry-run: rclone exit {res.returncode}")
+        log(f"{remote}: dry-run exit={res.returncode}: {summary.errors[-1]}")
+        return None, summary
+    return count_dry_run_removals(lines), summary
 
 
 def count_dry_run_removals(lines: list[str]) -> int:
@@ -402,18 +411,29 @@ def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".filter", delete=False) as fh:
         fh.write("\n".join(filter_lines(dirs)) + "\n")
         filter_file = fh.name
-    pending = count_pending_deletes(remote, filter_file, versions, max(600, max_duration // 2))
-    if pending is None or pending > MAX_DELETE:
+    def skipped(status: str, error: str, errors: list[str]) -> dict:
         os.unlink(filter_file)
-        error = (f"{remote}: на NAS пропало {pending} файлов (предел {MAX_DELETE}) — прогон не запущен, "
-                 "в Drive ничего не изменено" if pending is not None
-                 else f"{remote}: не удалось посчитать удаления заранее — прогон не запущен")
         log(error)
-        return {"remote": remote, "status": "too_many_deletes" if pending is not None else "error",
-                "error": error, "bytesTransferred": 0, "filesTransferred": 0, "movedToVersions": 0,
-                "errors": [error[:ERROR_CHARS]], "planBytes": None, "remainingBytes": None, "quota": None,
+        return {"remote": remote, "status": status, "error": error, "bytesTransferred": 0,
+                "filesTransferred": 0, "movedToVersions": 0, "errors": errors or [error[:ERROR_CHARS]],
+                "planBytes": None, "remainingBytes": None, "quota": None,
                 "durationSec": int(time.time() - started)}
-    max_duration = max(300, max_duration - int(time.time() - started))
+
+    # Пробный обход не должен съесть окно: на сам sync оставляем не меньше 5 минут.
+    pending, dry = count_pending_deletes(remote, filter_file, versions, max(60, max_duration - 300))
+    if pending is None:
+        status = classify(1, dry)
+        if status == "auth_error":
+            return skipped(status, f"{remote}: ошибка авторизации Google — заново rclone authorize \"drive\"",
+                           dry.errors)
+        return skipped("error", f"{remote}: не удалось посчитать удаления заранее — прогон не запущен"
+                       + (f" ({dry.errors[-1]})" if dry.errors else ""), dry.errors)
+    if pending > MAX_DELETE:
+        return skipped("too_many_deletes", f"{remote}: на NAS пропало {pending} файлов (предел {MAX_DELETE}) — "
+                       "прогон не запущен, в Drive ничего не изменено", [])
+    max_duration -= int(time.time() - started)
+    if max_duration < 300:
+        return skipped("partial", f"{remote}: окно закончилось после проверки удалений — sync в следующую ночь", [])
     cmd = ["rclone", "--config", RCLONE_CONFIG, "sync", FILES_ROOT, f"{remote}:{DEST_DIR}",
            "--filter-from", filter_file,
            "--backup-dir", f"{remote}:{VERSIONS_DIR}/{versions}",
