@@ -6,7 +6,7 @@ options=/data/options.json
 files_enabled="$(jq -r '.files_enabled // false' "$options")"
 files_root="$(jq -r '.files_root // "/share/NAS"' "$options")"
 token_file="$(jq -r '.token_file' "$options")"
-mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
+mount_check_enabled="$(jq -r 'if .mount_check_enabled == null then true else .mount_check_enabled end' "$options")"
 
 if [[ "$files_enabled" != "true" ]]; then
   echo "File API disabled (files_enabled != true)"

@@ -1,5 +1,5 @@
 name: Archive Sync Worker
-version: "0.12.6"
+version: "0.13.0"
 slug: archive_sync
 description: Resumable file synchronization worker for a mounted storage share
 url: https://github.com/traglodit22/dashboard-nas-sync
@@ -52,6 +52,15 @@ options:
   import_dir_scan_timeout_seconds: 180
   previews_enabled: false
   previews_parallel: 4
+  gdrive_enabled: false
+  gdrive_rclone_config: /homeassistant/.rclone/rclone.conf
+  gdrive_plan_json: "[]"
+  gdrive_window_start_utc: 22
+  gdrive_window_hours: 6
+  gdrive_max_transfer_gb: 700
+  gdrive_max_delete: 2000
+  gdrive_bwlimit: ""
+  gdrive_versions_days: 90
 schema:
   service_url: str
   token_file: str
@@ -85,3 +94,12 @@ schema:
   import_dir_scan_timeout_seconds: int(30,3600)
   previews_enabled: bool
   previews_parallel: int(1,8)
+  gdrive_enabled: bool
+  gdrive_rclone_config: str
+  gdrive_plan_json: str
+  gdrive_window_start_utc: int(0,23)
+  gdrive_window_hours: int(1,24)
+  gdrive_max_transfer_gb: int(1,750)
+  gdrive_max_delete: int(0,1000000)
+  gdrive_bwlimit: str?
+  gdrive_versions_days: int(1,3650)

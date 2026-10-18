@@ -12,7 +12,7 @@ backup_enabled="$(jq -r '.backup_enabled // false' "$options")"
 backup_destination_root="$(jq -r '.backup_destination_root // "/share/NAS/backups"' "$options")"
 backup_project_name="$(jq -r '.backup_project_name // "dashboard"' "$options")"
 backup_projects_json="$(jq -r '.backup_projects_json // "[]"' "$options")"
-mount_check_enabled="$(jq -r '.mount_check_enabled // true' "$options")"
+mount_check_enabled="$(jq -r 'if .mount_check_enabled == null then true else .mount_check_enabled end' "$options")"
 
 export DASHBOARD_URL="$service_url"
 export NAS_BACKUP_ROOT="$backup_destination_root"

@@ -1,0 +1,81 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+options=/data/options.json
+service_url="$(jq -r '.service_url' "$options")"
+token_file="$(jq -r '.token_file' "$options")"
+gdrive_enabled="$(jq -r '.gdrive_enabled // false' "$options")"
+files_root="$(jq -r '.files_root // "/share/NAS"' "$options")"
+# `// true` превратил бы явный false в true — поэтому через null.
+mount_check_enabled="$(jq -r 'if .mount_check_enabled == null then true else .mount_check_enabled end' "$options")"
+window_start="$(jq -r '.gdrive_window_start_utc // 22' "$options")"
+window_hours="$(jq -r '.gdrive_window_hours // 6' "$options")"
+plan_json="$(jq -r '.gdrive_plan_json // "[]"' "$options")"
+
+if [[ "$gdrive_enabled" != "true" ]]; then
+  echo "[gdrive] disabled (gdrive_enabled != true)"
+  exec sleep infinity
+fi
+
+export DASHBOARD_URL="$service_url"
+export FILES_ROOT="$files_root"
+export MOUNT_CHECK_ENABLED="$mount_check_enabled"
+export GDRIVE_PLAN_JSON="$plan_json"
+GDRIVE_RCLONE_CONFIG="$(jq -r '.gdrive_rclone_config // "/homeassistant/.rclone/rclone.conf"' "$options")"
+GDRIVE_MAX_TRANSFER_GB="$(jq -r '.gdrive_max_transfer_gb // 700' "$options")"
+GDRIVE_MAX_DELETE="$(jq -r '.gdrive_max_delete // 2000' "$options")"
+GDRIVE_BWLIMIT="$(jq -r '.gdrive_bwlimit // ""' "$options")"
+GDRIVE_VERSIONS_DAYS="$(jq -r '.gdrive_versions_days // 90' "$options")"
+export GDRIVE_RCLONE_CONFIG GDRIVE_MAX_TRANSFER_GB GDRIVE_MAX_DELETE GDRIVE_BWLIMIT GDRIVE_VERSIONS_DAYS
+export GDRIVE_STATE_FILE="/data/gdrive-state.json"
+
+# Пустой план — «разведка»: первый прогон сразу при старте, дальше — в окне.
+scan_now=false
+if jq -e '(.gdrive_plan_json // "[]") | fromjson | type == "array" and length == 0' "$options" >/dev/null 2>&1; then
+  scan_now=true
+fi
+
+echo "[gdrive] service started: window ${window_start}:00 UTC +${window_hours}h, root=$files_root scan=$scan_now"
+
+# Последнее начало окна (<= сейчас) и его конец, epoch UTC.
+window_bounds() {
+  local now day_start
+  now="$(date -u +%s)"
+  day_start=$(( now - now % 86400 ))
+  window_from=$(( day_start + window_start * 3600 ))
+  if (( window_from > now )); then
+    window_from=$(( window_from - 86400 ))
+  fi
+  window_to=$(( window_from + window_hours * 3600 ))
+}
+
+run_once() {
+  NAS_SYNC_TOKEN="$(tr -d '\r\n' < "$token_file" 2>/dev/null || true)"
+  export NAS_SYNC_TOKEN GDRIVE_WINDOW_END="$window_to"
+  code=0
+  /usr/local/bin/archive-sync-gdrive || code=$?
+}
+
+while true; do
+  window_bounds
+  now="$(date -u +%s)"
+  if [[ "$scan_now" != "true" ]] && (( now >= window_to )); then
+    wait_s=$(( window_from + 86400 - now ))
+    echo "[gdrive] waiting ${wait_s}s for the next window"
+    sleep "$wait_s"
+    continue
+  fi
+  scan_now=false
+  run_once
+  now="$(date -u +%s)"
+  if [[ "$code" == "3" ]] && (( now + 1800 < window_to )); then
+    echo "[gdrive] storage or config unavailable; retrying in 30 min"
+    sleep 1800
+    continue
+  fi
+  # Прогон в окне — один: дальше спим до начала следующего окна.
+  wait_s=$(( window_from + 86400 - now ))
+  (( wait_s > 0 )) || wait_s=60
+  echo "[gdrive] run finished (exit=$code); next window in ${wait_s}s"
+  sleep "$wait_s"
+done

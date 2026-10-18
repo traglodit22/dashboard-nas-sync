@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""Копия NAS в Google Drive через rclone (nas-gdrive-backup).
+
+Каждая верхняя папка FILES_ROOT из плана (GDRIVE_PLAN_JSON) уходит в свой аккаунт
+(gdrive1 / gdrive2): один `rclone sync` на аккаунт, аккаунты параллельно. Удалённое и
+перезаписанное на NAS переезжает в `<remote>:_versions/<YYYY-MM-DD>/<HHMMSS-xxxxxx>/`
+(дата и id прогона: повторный прогон в тот же день не затирает версии первого), а не пропадает.
+Пустой план — режим «разведка»: только размеры верхних папок и место в Drive.
+
+Перед прогоном — проверка монтирования (как у archive-import) и непустых папок плана:
+на отвалившейся шаре `sync` стёр бы копию. Итог — один POST на /api/sync/nas/gdrive.
+Конфиг rclone с токенами Google не печатается и в отчёт не попадает.
+
+Коды выхода: 0 — прогон завершён (ok/partial/разведка), 1 — ошибка прогона,
+3 — хранилище или конфиг недоступны (повтор через 30 мин в пределах окна).
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+EXIT_OK, EXIT_FAIL, EXIT_UNAVAILABLE = 0, 1, 3
+REMOTES = ("gdrive1", "gdrive2")
+DEST_DIR = "NAS"
+VERSIONS_DIR = "_versions"
+DAY = 86400
+STATS_TTL = 20 * 3600  # «раз в сутки»: прогоны идут раз в окно, кэш гасит только повторы по коду 3
+CLEANUP_EVERY = 7 * DAY
+KEEP_ERRORS = 20
+ERROR_CHARS = 300
+
+
+def env_str(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on")
+
+
+DASHBOARD_URL = env_str("DASHBOARD_URL", "").rstrip("/")
+TOKEN = os.environ.get("NAS_SYNC_TOKEN", "").strip()
+FILES_ROOT = os.path.realpath(env_str("FILES_ROOT", "/share/NAS"))
+RCLONE_CONFIG = env_str("GDRIVE_RCLONE_CONFIG", "/homeassistant/.rclone/rclone.conf")
+PLAN_JSON = env_str("GDRIVE_PLAN_JSON", "[]")
+MAX_TRANSFER_GB = env_int("GDRIVE_MAX_TRANSFER_GB", 700, 1)
+MAX_DELETE = env_int("GDRIVE_MAX_DELETE", 2000, 0)
+BWLIMIT = os.environ.get("GDRIVE_BWLIMIT", "").strip()
+VERSIONS_DAYS = env_int("GDRIVE_VERSIONS_DAYS", 90, 1)
+WINDOW_END = env_int("GDRIVE_WINDOW_END", 0, 0)  # epoch конца окна (считает сервис)
+MOUNT_CHECK = env_bool("MOUNT_CHECK_ENABLED", True)
+MOUNT_BASE = env_str("NAS_MOUNT_BASE", "/share")
+PROBE_TIMEOUT = env_int("GDRIVE_PROBE_TIMEOUT_SECONDS", 120, 5)
+SCAN_TIMEOUT = env_int("GDRIVE_SCAN_TIMEOUT_SECONDS", 3600, 30)
+STATE_FILE = env_str("GDRIVE_STATE_FILE", "/data/gdrive-state.json")
+
+
+def log(msg: str) -> None:
+    print(f"[gdrive] {msg}", flush=True)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+# --- Состояние (/data) --------------------------------------------------------
+
+def read_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state: dict) -> None:
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except OSError as exc:
+        log(f"cannot save state: {exc}")
+
+
+# --- Хранилище ------------------------------------------------------------------
+
+def run_with_timeout(func, timeout: int):
+    """Копия archive-import: зависший syscall на сетевом шаре не вешает прогон."""
+    result: dict = {}
+
+    def target() -> None:
+        try:
+            result["value"] = func()
+        except Exception as exc:  # noqa: BLE001 — передаём наружу как результат
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"timeout after {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def mount_state(path: str) -> str:
+    """mounted | not_mounted | unknown — точная копия archive-import (mount_state, v0.10.41):
+    шара смонтирована, если st_dev пути отличается от st_dev базы /share."""
+    if not MOUNT_CHECK:
+        return "mounted"
+    base = MOUNT_BASE.rstrip("/") or "/"
+    if not os.path.isdir(base) or not (path == base or path.startswith(base + "/")):
+        return "unknown"
+    probe = path
+    while not os.path.exists(probe) and probe != "/":
+        probe = os.path.dirname(probe)
+    try:
+        return "not_mounted" if os.stat(probe).st_dev == os.stat(base).st_dev else "mounted"
+    except OSError:
+        return "unknown"
+
+
+def has_file(path: str) -> bool:
+    """Есть ли в папке хотя бы один файл. Без -maxdepth: -quit останавливает обход на первом."""
+    try:
+        res = subprocess.run(["timeout", str(PROBE_TIMEOUT), "find", path, "-type", "f", "-print", "-quit"],
+                             capture_output=True, timeout=PROBE_TIMEOUT + 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Код find не смотрим: 1 бывает из-за нечитаемой подпапки, хотя файл уже найден.
+    return bool(res.stdout.strip())
+
+
+def top_dirs() -> list[str]:
+    return sorted(e.name for e in os.scandir(FILES_ROOT) if e.is_dir(follow_symlinks=False))
+
+
+def du_bytes(path: str) -> int | None:
+    try:
+        res = subprocess.run(niced(["timeout", str(SCAN_TIMEOUT), "du", "-sb", path]),
+                             capture_output=True, timeout=SCAN_TIMEOUT + 30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        return int(res.stdout.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def niced(cmd: list[str]) -> list[str]:
+    prefix = ["nice", "-n", "10"]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c", "3"]
+    return prefix + cmd
+
+
+# --- План и фильтр ----------------------------------------------------------------
+
+def parse_plan(raw: str) -> list[dict]:
+    """[{"dir": "Галерея", "remote": "gdrive1"}, …]; ValueError — понятный текст ошибки."""
+    try:
+        plan = json.loads(raw or "[]")
+    except ValueError as exc:
+        raise ValueError(f"gdrive_plan_json is not valid JSON: {exc}") from exc
+    if not isinstance(plan, list):
+        raise ValueError("gdrive_plan_json must be a JSON array")
+    seen: set[str] = set()
+    out = []
+    for item in plan:
+        if not isinstance(item, dict):
+            raise ValueError("gdrive_plan_json items must be objects")
+        name, remote = item.get("dir"), item.get("remote")
+        if not isinstance(name, str) or not name or name != name.strip() or "/" in name \
+                or "\n" in name or name in (".", ".."):
+            raise ValueError(f"bad plan dir: {name!r}")
+        if remote not in REMOTES:
+            raise ValueError(f"bad plan remote for {name!r}: {remote!r}")
+        if name in seen:
+            raise ValueError(f"plan dir listed twice: {name!r}")
+        seen.add(name)
+        out.append({"dir": name, "remote": remote})
+    return out
+
+
+_GLOB_SPECIAL = re.compile(r"([\\*?\[\]{}])")
+
+
+def filter_lines(dirs: list[str]) -> list[str]:
+    """Фильтр rclone: каждая папка плана от корня, всё остальное — мимо.
+    Спецсимволы glob экранируются обратной косой; кириллица идёт как есть (UTF-8)."""
+    lines = ["+ /" + _GLOB_SPECIAL.sub(r"\\\1", d) + "/**" for d in dirs]
+    return lines + ["- **"]
+
+
+def config_sections(path: str) -> set[str]:
+    """Только имена секций [..]; содержимое (токены) не читается дальше заголовков."""
+    names = set()
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+            if m:
+                names.add(m.group(1).strip())
+    return names
+
+
+# --- Разбор JSON-лога rclone ------------------------------------------------------
+
+_SECRET = re.compile(r"(ya29\.[\w.-]+|1//[\w.-]+|(access|refresh)_token\"?\s*[:=]\s*\"?[^\s\",}]+)")
+
+
+def redact(text: str) -> str:
+    return _SECRET.sub("***", text)
+
+
+class LogSummary:
+    """Итог по строкам `--use-json-log`: последняя статистика, переносы в _versions, ошибки."""
+
+    def __init__(self) -> None:
+        self.stats: dict = {}
+        self.moved = 0
+        self.errors: list[str] = []
+        self.flags: set[str] = set()
+
+    def feed(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            entry = json.loads(line)
+            if not isinstance(entry, dict):
+                raise ValueError
+        except ValueError:
+            entry = {"level": "error" if "ERROR" in line or "panic" in line else "info", "msg": line}
+        msg = str(entry.get("msg") or "")
+        level = str(entry.get("level") or "").lower()
+        if isinstance(entry.get("stats"), dict):
+            self.stats = entry["stats"]
+        # С --backup-dir и удаление, и перезапись — серверный перенос старой копии в _versions.
+        if msg.startswith("Moved (server-side)"):
+            self.moved += 1
+        low = msg.lower()
+        is_error = level in ("error", "critical", "alert", "emergency")
+        # Флаги — только по строкам ошибок: в info-строках переноса есть путь файла,
+        # и файл oauth2client.js не должен превращать прогон в «ошибку авторизации».
+        if is_error:
+            if "max-delete threshold" in low or "max-delete limit" in low:
+                self.flags.add("max_delete")
+            if "upload limit" in low:
+                self.flags.add("upload_limit")
+            # Только явный отказ Google; сетевой сбой при получении токена — обычная ошибка.
+            if any(k in low for k in ("invalid_grant", "unauthorized_client", "token has been expired or revoked",
+                                      "error 401", "invalid credentials")):
+                self.flags.add("auth")
+        if is_error:
+            obj = entry.get("object")
+            text = f"{obj}: {msg}" if obj else msg
+            self.errors.append(redact(text.strip())[:ERROR_CHARS])
+            del self.errors[:-KEEP_ERRORS]
+
+    def bytes(self) -> int:
+        return int(self.stats.get("bytes") or 0)
+
+    def transfers(self) -> int:
+        return int(self.stats.get("transfers") or 0)
+
+    def moved_to_versions(self) -> int:
+        return max(self.moved, int(self.stats.get("serverSideMoves") or 0))
+
+
+def classify(code: int, summary: LogSummary) -> str:
+    """Код выхода rclone + сообщения → статус аккаунта.
+    rclone: 7 — фатальная, 8 — --max-transfer, 10 — --max-duration."""
+    if "max_delete" in summary.flags:
+        return "too_many_deletes"
+    if "auth" in summary.flags:
+        return "auth_error"
+    if code in (8, 10) or "upload_limit" in summary.flags:
+        return "partial"
+    if code == 0:
+        return "ok"
+    return "error"
+
+
+def expired_version_dirs(names: list[str], today: dt.date, days: int) -> list[str]:
+    """Папки _versions/<YYYY-MM-DD>/ старше срока (удаляются целиком, со всеми прогонами дня).
+    Возраст — по имени папки (дате прогона):
+    --backup-dir сохраняет mtime файла, поэтому --min-age стёр бы старое фото сразу."""
+    out = []
+    for raw in names:
+        name = raw.strip().rstrip("/")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", name):
+            continue
+        try:
+            day = dt.date.fromisoformat(name)
+        except ValueError:
+            continue
+        if (today - day).days > days:
+            out.append(name)
+    return sorted(out)
+
+
+# --- rclone ---------------------------------------------------------------------
+
+def rclone(args: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
+    return subprocess.run(niced(["rclone", "--config", RCLONE_CONFIG, *args]),
+                          capture_output=True, timeout=timeout)
+
+
+def rclone_json(args: list[str], timeout: int = 600):
+    try:
+        res = rclone([*args, "--json"], timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"rclone {args[0]} failed: {exc}")
+        return None
+    if res.returncode != 0:
+        log(f"rclone {args[0]} {args[1] if len(args) > 1 else ''} exit={res.returncode}: "
+            f"{redact(res.stderr.decode(errors='replace').strip())[-ERROR_CHARS:]}")
+        return None
+    try:
+        return json.loads(res.stdout or b"null")
+    except ValueError:
+        return None
+
+
+def quota(remote: str) -> dict | None:
+    data = rclone_json(["about", f"{remote}:"], 180)
+    if not isinstance(data, dict):
+        return None
+    return {k: (int(data[k]) if isinstance(data.get(k), (int, float)) else None) for k in ("total", "used", "free")}
+
+
+def version_subdir(started: dt.datetime, run_id: str) -> str:
+    """`<YYYY-MM-DD>/<HHMMSS>-<6 hex>` — уникально на прогон: --backup-dir в ту же папку
+    при втором прогоне за день заменил бы уже сохранённую версию (A→B, затем B→C теряет A)."""
+    return f"{started:%Y-%m-%d}/{started:%H%M%S}-{run_id.replace('-', '')[:6]}"
+
+
+def count_pending_deletes(remote: str, filter_file: str, versions: str, timeout: int) -> int | None:
+    """Сколько файлов sync уберёт из NAS/ (удалит или перенесёт в _versions) — пробным `--dry-run`.
+    --max-delete сам по себе не спасает: rclone успевает перенести первые N файлов и только потом
+    падает. Поэтому считаем заранее и при превышении не запускаем sync вовсе. None — посчитать не удалось."""
+    cmd = ["rclone", "--config", RCLONE_CONFIG, "sync", FILES_ROOT, f"{remote}:{DEST_DIR}",
+           "--filter-from", filter_file, "--backup-dir", f"{remote}:{VERSIONS_DIR}/{versions}",
+           "--dry-run", "--fast-list", "--checkers", "8", "--use-json-log", "--log-level", "NOTICE"]
+    try:
+        res = subprocess.run(niced(cmd), capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"{remote}: dry-run failed: {exc}")
+        return None
+    if res.returncode != 0:
+        log(f"{remote}: dry-run exit={res.returncode}")
+        return None
+    return count_dry_run_removals(res.stderr.decode("utf-8", errors="replace").splitlines()
+                                  + res.stdout.decode("utf-8", errors="replace").splitlines())
+
+
+def count_dry_run_removals(lines: list[str]) -> int:
+    """Строки dry-run «Skipped delete/move as --dry-run is set»: удаление или перенос в _versions."""
+    n = 0
+    for line in lines:
+        try:
+            msg = str(json.loads(line).get("msg") or "")
+        except (ValueError, AttributeError):
+            msg = line
+        if "--dry-run" in msg and ("Skipped delete" in msg or "Skipped move" in msg):
+            n += 1
+    return n
+
+
+def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) -> dict:
+    started = time.time()
+    summary = LogSummary()
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".filter", delete=False) as fh:
+        fh.write("\n".join(filter_lines(dirs)) + "\n")
+        filter_file = fh.name
+    pending = count_pending_deletes(remote, filter_file, versions, max(600, max_duration // 2))
+    if pending is None or pending > MAX_DELETE:
+        os.unlink(filter_file)
+        error = (f"{remote}: на NAS пропало {pending} файлов (предел {MAX_DELETE}) — прогон не запущен, "
+                 "в Drive ничего не изменено" if pending is not None
+                 else f"{remote}: не удалось посчитать удаления заранее — прогон не запущен")
+        log(error)
+        return {"remote": remote, "status": "too_many_deletes" if pending is not None else "error",
+                "error": error, "bytesTransferred": 0, "filesTransferred": 0, "movedToVersions": 0,
+                "errors": [error[:ERROR_CHARS]], "planBytes": None, "remainingBytes": None, "quota": None,
+                "durationSec": int(time.time() - started)}
+    max_duration = max(300, max_duration - int(time.time() - started))
+    cmd = ["rclone", "--config", RCLONE_CONFIG, "sync", FILES_ROOT, f"{remote}:{DEST_DIR}",
+           "--filter-from", filter_file,
+           "--backup-dir", f"{remote}:{VERSIONS_DIR}/{versions}",
+           "--max-transfer", f"{MAX_TRANSFER_GB}G", "--cutoff-mode", "soft",
+           "--max-duration", f"{max_duration}s",
+           "--drive-stop-on-upload-limit", "--max-delete", str(MAX_DELETE),
+           "--fast-list", "--transfers", "4", "--checkers", "8",
+           "--use-json-log", "--log-level", "INFO", "--stats", "1m", "--stats-log-level", "NOTICE"]
+    if BWLIMIT:
+        cmd += ["--bwlimit", BWLIMIT]
+    log(f"{remote}: sync {', '.join(dirs)} (max {MAX_TRANSFER_GB}G, {max_duration}s)")
+    code = -1
+    try:
+        proc = subprocess.Popen(niced(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # Страховка: soft cutoff дожидается начатых файлов; больше часа сверх окна — убиваем.
+        killer = threading.Timer(max_duration + 3600, proc.kill)
+        killer.start()
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", errors="replace")
+                before = len(summary.errors)
+                summary.feed(line)
+                if len(summary.errors) > before:
+                    log(f"{remote}: {summary.errors[-1]}")
+                elif '"stats"' in line:
+                    log(f"{remote}: {summary.bytes() / 1e9:.1f} GB, {summary.transfers()} files")
+            code = proc.wait()
+        finally:
+            killer.cancel()
+    except OSError as exc:
+        summary.errors.append(f"cannot start rclone: {exc}"[:ERROR_CHARS])
+    finally:
+        os.unlink(filter_file)
+    status = classify(code, summary)
+    error = None
+    if status == "too_many_deletes":
+        error = f"{remote}: слишком много удалений (больше {MAX_DELETE}) — часть уже перенесена в {VERSIONS_DIR}/{versions}"
+    elif status == "auth_error":
+        error = f"{remote}: ошибка авторизации Google — заново rclone authorize \"drive\""
+    elif status == "error":
+        error = summary.errors[-1] if summary.errors else f"rclone exit {code}"
+    log(f"{remote}: exit={code} status={status} {summary.bytes() / 1e9:.1f} GB "
+        f"{summary.transfers()} files, moved to versions {summary.moved_to_versions()}")
+    return {"remote": remote, "status": status, "error": error,
+            "bytesTransferred": summary.bytes(), "filesTransferred": summary.transfers(),
+            "movedToVersions": summary.moved_to_versions(), "errors": summary.errors,
+            "planBytes": None, "remainingBytes": None, "quota": None,
+            "durationSec": int(time.time() - started)}
+
+
+def refresh_du(state: dict, names: list[str], force: bool = False) -> dict:
+    """Размеры верхних папок — раз в сутки, кэш в /data."""
+    cache = state.get("du") or {}
+    if not force and time.time() - float(cache.get("ts") or 0) < STATS_TTL and all(n in (cache.get("dirs") or {}) for n in names):
+        return cache["dirs"]
+    sizes = {}
+    for name in names:
+        size = du_bytes(os.path.join(FILES_ROOT, name))
+        log(f"du {name}: {size if size is not None else 'timeout/error'}")
+        if size is not None:
+            sizes[name] = size
+    state["du"] = {"ts": time.time(), "dirs": sizes}
+    write_state(state)
+    return sizes
+
+
+def dest_size(state: dict, remote: str, dirs: list[str]) -> int | None:
+    cache = (state.get("size") or {}).get(remote) or {}
+    if time.time() - float(cache.get("ts") or 0) < STATS_TTL and cache.get("dirs") == sorted(dirs):
+        return cache.get("bytes")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".filter", delete=False) as fh:
+        fh.write("\n".join(filter_lines(dirs)) + "\n")
+        filter_file = fh.name
+    try:
+        data = rclone_json(["size", f"{remote}:{DEST_DIR}", "--fast-list", "--filter-from", filter_file], 3 * 3600)
+    finally:
+        os.unlink(filter_file)
+    if not isinstance(data, dict):
+        return cache.get("bytes")
+    size = int(data.get("bytes") or 0)
+    state.setdefault("size", {})[remote] = {"ts": time.time(), "bytes": size, "dirs": sorted(dirs)}
+    write_state(state)
+    return size
+
+
+def cleanup_versions(state: dict, remote: str) -> None:
+    last = float((state.get("cleanup") or {}).get(remote) or 0)
+    if time.time() - last < CLEANUP_EVERY:
+        return
+    try:
+        res = rclone(["lsf", f"{remote}:{VERSIONS_DIR}", "--dirs-only"], 600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"{remote}: versions listing failed: {exc}")
+        return
+    if res.returncode not in (0, 3):  # 3 — папки _versions ещё нет
+        log(f"{remote}: versions listing exit={res.returncode}")
+        return
+    names = res.stdout.decode("utf-8", errors="replace").splitlines()
+    for name in expired_version_dirs(names, dt.datetime.now(dt.timezone.utc).date(), VERSIONS_DAYS):
+        try:
+            purge = rclone(["purge", f"{remote}:{VERSIONS_DIR}/{name}", "--drive-use-trash=false"], 3600)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"{remote}: purge {name} failed: {exc}")
+            return
+        log(f"{remote}: purged {VERSIONS_DIR}/{name} exit={purge.returncode}")
+        if purge.returncode != 0:
+            return  # срок не отмечаем — повторим на следующем прогоне, а не через неделю
+    state.setdefault("cleanup", {})[remote] = time.time()
+    write_state(state)
+
+
+# --- Отчёт ----------------------------------------------------------------------
+
+def post_report(report: dict) -> None:
+    if not DASHBOARD_URL or not TOKEN:
+        log("DASHBOARD_URL or NAS_SYNC_TOKEN missing — report skipped")
+        return
+    data = json.dumps(report, ensure_ascii=False).encode("utf-8")
+    headers = {"Authorization": f"Bearer {TOKEN}", "X-NAS-Agent-Id": "archive-sync-gdrive",
+               "Content-Type": "application/json"}
+    for attempt in range(3):
+        req = urllib.request.Request(f"{DASHBOARD_URL}/api/sync/nas/gdrive", data=data, method="POST",
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                log(f"report sent (HTTP {resp.status})")
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                log("dashboard has no /api/sync/nas/gdrive yet — report skipped")
+                return
+            if exc.code not in (502, 503, 504):
+                log(f"report rejected (HTTP {exc.code})")
+                return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(5 * (attempt + 1))
+    log("report failed: dashboard unreachable")
+
+
+_SEVERITY = ["ok", "partial", "error", "too_many_deletes", "auth_error", "storage_unavailable"]
+
+
+def overall(accounts: list[dict]) -> str:
+    return max((a["status"] for a in accounts), key=_SEVERITY.index, default="ok")
+
+
+def finish(report: dict, status: str, error: str | None, code: int) -> int:
+    report.update(status=status, error=error, finishedAt=now_iso())
+    log(f"run {report['runId']} mode={report['mode']} status={status}" + (f": {error}" if error else ""))
+    post_report(report)
+    return code
+
+
+# --- Прогон ---------------------------------------------------------------------
+
+def main() -> int:
+    report: dict = {"runId": str(uuid.uuid4()), "mode": "scan", "status": "ok", "error": None,
+                    "startedAt": now_iso(), "finishedAt": None, "dirs": [], "accounts": []}
+    try:
+        plan = parse_plan(PLAN_JSON)
+    except ValueError as exc:
+        return finish(report, "error", str(exc), EXIT_UNAVAILABLE)
+    report["mode"] = "sync" if plan else "scan"
+
+    sections: set[str] = set()
+    if os.path.isfile(RCLONE_CONFIG):
+        try:
+            sections = config_sections(RCLONE_CONFIG)
+        except OSError as exc:
+            return finish(report, "error", f"cannot read rclone config: {exc.strerror}", EXIT_UNAVAILABLE)
+    needed = sorted({p["remote"] for p in plan})
+    missing = [r for r in needed if r not in sections]
+    if plan and (not os.path.isfile(RCLONE_CONFIG) or missing):
+        return finish(report, "error", f"rclone config {RCLONE_CONFIG}: нет секций {', '.join(missing) or needed}",
+                      EXIT_UNAVAILABLE)
+
+    # Шара: реальное монтирование и непустые папки плана — иначе sync стёр бы копию в Drive.
+    try:
+        state_mount = run_with_timeout(lambda: mount_state(FILES_ROOT), PROBE_TIMEOUT)
+        names = run_with_timeout(top_dirs, PROBE_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        return finish(report, "storage_unavailable", f"хранилище недоступно: {exc}", EXIT_UNAVAILABLE)
+    if state_mount == "not_mounted":
+        return finish(report, "storage_unavailable", f"хранилище недоступно: {FILES_ROOT} не смонтирован",
+                      EXIT_UNAVAILABLE)
+    if state_mount == "unknown":
+        log(f"warning: cannot determine mount state for {FILES_ROOT}; continuing")
+    empty = [p["dir"] for p in plan if p["dir"] not in names or not has_file(os.path.join(FILES_ROOT, p["dir"]))]
+    if empty:
+        return finish(report, "storage_unavailable", f"хранилище недоступно: пусто или нет папок {', '.join(empty)}",
+                      EXIT_UNAVAILABLE)
+
+    state = read_state()
+    remote_of = {p["dir"]: p["remote"] for p in plan}
+
+    if not plan:
+        sizes = refresh_du(state, names, force=True)  # разведка всегда считает заново
+        report["dirs"] = [{"dir": n, "bytes": sizes[n], "files": None, "remote": None} for n in names if n in sizes]
+        report["accounts"] = [{"remote": r, "status": "ok", "error": None, "bytesTransferred": 0,
+                               "filesTransferred": 0, "movedToVersions": 0, "errors": [], "planBytes": None,
+                               "remainingBytes": None, "quota": quota(r), "durationSec": 0}
+                              for r in REMOTES if r in sections]
+        return finish(report, "ok", None, EXIT_OK)
+
+    max_duration = (WINDOW_END - int(time.time())) if WINDOW_END else 6 * 3600
+    if max_duration < 300:
+        return finish(report, "partial", "окно закончилось до старта", EXIT_OK)
+    versions = version_subdir(dt.datetime.now(dt.timezone.utc), report["runId"])
+    by_remote: dict[str, list[str]] = {}
+    for p in plan:
+        by_remote.setdefault(p["remote"], []).append(p["dir"])
+    with concurrent.futures.ThreadPoolExecutor(len(by_remote)) as pool:
+        futures = {r: pool.submit(sync_remote, r, dirs, max_duration, versions) for r, dirs in by_remote.items()}
+        accounts = [futures[r].result() for r in sorted(futures)]
+
+    sizes = refresh_du(state, names)
+    for acc in accounts:
+        remote, dirs = acc["remote"], by_remote[acc["remote"]]
+        acc["quota"] = quota(remote)
+        if acc["status"] == "auth_error":
+            continue
+        if all(d in sizes for d in dirs):
+            acc["planBytes"] = sum(sizes[d] for d in dirs)
+            dest = dest_size(state, remote, dirs)
+            if dest is not None:
+                acc["remainingBytes"] = max(0, acc["planBytes"] - dest)
+        cleanup_versions(state, remote)
+
+    report["accounts"] = accounts
+    report["dirs"] = [{"dir": n, "bytes": sizes[n], "files": None, "remote": remote_of.get(n)}
+                      for n in names if n in sizes]
+    status = overall(accounts)
+    errors = [a["error"] for a in accounts if a["error"]]
+    return finish(report, status, "; ".join(errors)[:ERROR_CHARS] if errors else None,
+                  EXIT_OK if status in ("ok", "partial") else EXIT_FAIL)
+
+
+# --- Самопроверка (--self-test) -------------------------------------------------
+
+def self_test() -> int:
+    def feed(lines: list[dict | str]) -> LogSummary:
+        s = LogSummary()
+        for item in lines:
+            s.feed(item if isinstance(item, str) else json.dumps(item))
+        return s
+
+    stats = {"level": "notice", "msg": "\nTransferred: 1 GiB", "source": "accounting/stats.go:482",
+             "stats": {"bytes": 1073741824, "transfers": 12, "serverSideMoves": 1, "errors": 0}}
+    ok = feed([
+        {"level": "info", "msg": "Copied (new)", "object": "Галерея/2024/01/a.jpg"},
+        {"level": "info", "msg": "Moved (server-side) to: _versions/2026-10-18/220001-ab12cd/Галерея/b.jpg",
+         "object": "Галерея/b.jpg"},
+        {"level": "info", "msg": "Moved into backup dir", "object": "Галерея/b.jpg"},
+        {"level": "info", "msg": "Moved (server-side)", "object": "Видео/c.mov"},
+        stats,
+    ])
+    assert classify(0, ok) == "ok" and ok.bytes() == 1073741824 and ok.transfers() == 12
+    assert ok.moved_to_versions() == 2 and not ok.errors
+
+    part = feed([{"level": "error", "msg": "Cancelling sync due to fatal error: max transfer limit reached as set by --max-transfer"}])
+    assert classify(8, part) == "partial"
+    assert classify(10, feed([])) == "partial"
+    upl = feed([{"level": "error", "msg": "Received upload limit error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded"}])
+    assert classify(7, upl) == "partial"
+
+    dele = feed([{"level": "error", "msg": "Couldn't move into backup dir: --max-delete threshold reached",
+                  "object": "Галерея/x.jpg"}])
+    assert classify(7, dele) == "too_many_deletes" and dele.errors[0].startswith("Галерея/x.jpg: ")
+
+    auth = feed([{"level": "critical", "msg": 'Failed to create file system: couldn\'t fetch token: '
+                  'oauth2: "invalid_grant" "Token has been expired or revoked." refresh_token="1//0gSECRET"'}])
+    assert classify(1, auth) == "auth_error"
+    assert "1//0gSECRET" not in auth.errors[0] and "***" in auth.errors[0]
+
+    path_noise = feed([{"level": "info", "object": "code/node_modules/google-auth-library/oauth2client.js",
+                        "msg": "Moved (server-side) to: _versions/2026-10-18/x/code/oauth2client.js"}])
+    assert classify(0, path_noise) == "ok" and path_noise.moved == 1
+    net = feed([{"level": "error", "msg": 'couldn\'t fetch token: Post "https://oauth2.googleapis.com/token": '
+                 "dial tcp: i/o timeout"}])
+    assert classify(1, net) == "error"
+    assert count_dry_run_removals([
+        '{"level":"notice","msg":"Skipped delete as --dry-run is set (size 1.2Mi)","object":"Галерея/a.jpg"}',
+        '{"level":"notice","msg":"Skipped move as --dry-run is set (size 3Mi)","object":"Галерея/b.jpg"}',
+        '{"level":"notice","msg":"Skipped copy as --dry-run is set (size 3Mi)","object":"Галерея/c.jpg"}',
+        "garbage"]) == 2
+
+    noise = feed(["args: sync --max-delete 2000 --max-transfer 700G"])
+    assert classify(0, noise) == "ok"
+
+    err = feed(["2026/10/18 ERROR : not json line", *[{"level": "error", "msg": f"e{i}" * 200} for i in range(30)]])
+    assert classify(2, err) == "error" and len(err.errors) == KEEP_ERRORS
+    assert all(len(e) <= ERROR_CHARS for e in err.errors)
+
+    assert filter_lines(["Галерея", "a*b [1]", "x{y}\\z"]) == [
+        "+ /Галерея/**", "+ /a\\*b \\[1\\]/**", "+ /x\\{y\\}\\\\z/**", "- **"]
+
+    try:
+        parse_plan('[{"dir": "../etc", "remote": "gdrive1"}]')
+        raise AssertionError("bad dir accepted")
+    except ValueError:
+        pass
+    assert parse_plan('[{"dir": "Галерея", "remote": "gdrive1"}]') == [{"dir": "Галерея", "remote": "gdrive1"}]
+
+    today = dt.date(2026, 10, 18)
+    names = ["2026-07-19/", "2026-07-20/", "2026-10-18/", "2025-01-01/", "notes/", "2026-13-01/", "2026-1-1/"]
+    assert expired_version_dirs(names, today, 90) == ["2025-01-01", "2026-07-19"]
+    started = dt.datetime(2026, 10, 18, 22, 0, 5, tzinfo=dt.timezone.utc)
+    assert version_subdir(started, "ab12cdef-0000-4000-8000-000000000000") == "2026-10-18/220005-ab12cd"
+    assert version_subdir(started, "ab12cdef-1") != version_subdir(started, "ff00aa11-1")
+
+    assert overall([{"status": "ok"}, {"status": "partial"}]) == "partial"
+    assert overall([{"status": "partial"}, {"status": "auth_error"}]) == "auth_error"
+    print("self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(self_test() if "--self-test" in sys.argv[1:] else main())
