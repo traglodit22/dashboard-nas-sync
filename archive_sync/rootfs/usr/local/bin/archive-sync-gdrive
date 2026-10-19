@@ -67,6 +67,8 @@ DASHBOARD_URL = env_str("DASHBOARD_URL", "").rstrip("/")
 TOKEN = os.environ.get("NAS_SYNC_TOKEN", "").strip()
 FILES_ROOT = os.path.realpath(env_str("FILES_ROOT", "/share/NAS"))
 RCLONE_CONFIG = env_str("GDRIVE_RCLONE_CONFIG", "/homeassistant/.rclone/rclone.conf")
+RCLONE_CONFIG_FALLBACKS = ("/homeassistant/rclone.conf", "/homeassistant/.rclone/rclone.conf",
+                           "/homeassistant/.config/rclone/rclone.conf", "/config/rclone.conf")
 PLAN_JSON = env_str("GDRIVE_PLAN_JSON", "[]")
 MAX_TRANSFER_GB = env_int("GDRIVE_MAX_TRANSFER_GB", 700, 1)
 MAX_DELETE = env_int("GDRIVE_MAX_DELETE", 2000, 0)
@@ -601,12 +603,27 @@ def main() -> int:
         return finish(report, "error", str(exc), EXIT_UNAVAILABLE)
     report["mode"] = "sync" if plan else "scan"
 
+    global RCLONE_CONFIG
+    needed = sorted({p["remote"] for p in plan})
     sections: set[str] = set()
     if os.path.isfile(RCLONE_CONFIG):
         try:
             sections = config_sections(RCLONE_CONFIG)
         except OSError as exc:
             return finish(report, "error", f"cannot read rclone config: {exc.strerror}", EXIT_UNAVAILABLE)
+    # Опция указывает не туда (часто остаётся путь по умолчанию) — берём известный файл, где секции есть.
+    if needed and any(r not in sections for r in needed):
+        for alt in RCLONE_CONFIG_FALLBACKS:
+            if alt == RCLONE_CONFIG or not os.path.isfile(alt):
+                continue
+            try:
+                alt_sections = config_sections(alt)
+            except OSError:
+                continue
+            if all(r in alt_sections for r in needed):
+                log(f"rclone config {RCLONE_CONFIG}: нет {', '.join(needed)}; беру {alt}")
+                RCLONE_CONFIG, sections = alt, alt_sections
+                break
     # Диагностика без секретов: какой файл читаем и какие секции (только имена) в нём есть.
     if not os.path.isfile(RCLONE_CONFIG):
         log(f"rclone config {RCLONE_CONFIG}: файл не найден (опция gdrive_rclone_config)")
@@ -614,10 +631,12 @@ def main() -> int:
         found = [r for r in REMOTES if r in sections]
         log(f"rclone config {RCLONE_CONFIG}: секции {', '.join(sorted(sections)) or 'нет'}; "
             f"Google: {', '.join(found) or 'нет ни gdrive1, ни gdrive2'}")
-    needed = sorted({p["remote"] for p in plan})
     missing = [r for r in needed if r not in sections]
-    if plan and (not os.path.isfile(RCLONE_CONFIG) or missing):
-        return finish(report, "error", f"rclone config {RCLONE_CONFIG}: нет секций {', '.join(missing) or needed}",
+    if plan and not os.path.isfile(RCLONE_CONFIG):
+        return finish(report, "error", f"rclone config {RCLONE_CONFIG}: файл не найден (опция gdrive_rclone_config)",
+                      EXIT_UNAVAILABLE)
+    if plan and missing:
+        return finish(report, "error", f"rclone config {RCLONE_CONFIG}: нет секций {', '.join(missing)}",
                       EXIT_UNAVAILABLE)
 
     # Шара: реальное монтирование и непустые папки плана — иначе sync стёр бы копию в Drive.
