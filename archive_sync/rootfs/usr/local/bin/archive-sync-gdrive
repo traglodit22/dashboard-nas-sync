@@ -640,7 +640,7 @@ def main() -> int:
     remote_of = {p["dir"]: p["remote"] for p in plan}
 
     if not plan:
-        sizes = refresh_du(state, names, force=True)  # разведка всегда считает заново
+        sizes = refresh_du(state, names)  # из кэша (неделя): перезапуск add-on не пересчитывает du заново
         report["dirs"] = [{"dir": n, "bytes": sizes[n], "files": None, "remote": None} for n in names if n in sizes]
         report["accounts"] = [{"remote": r, "status": "ok", "error": None, "bytesTransferred": 0,
                                "filesTransferred": 0, "movedToVersions": 0, "errors": [], "planBytes": None,
