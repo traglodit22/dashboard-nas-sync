@@ -250,6 +250,7 @@ class LogSummary:
     def __init__(self) -> None:
         self.stats: dict = {}
         self.moved = 0
+        self.first_byte_at: float | None = None
         self.errors: list[str] = []
         self.flags: set[str] = set()
 
@@ -267,6 +268,8 @@ class LogSummary:
         level = str(entry.get("level") or "").lower()
         if isinstance(entry.get("stats"), dict):
             self.stats = entry["stats"]
+            if self.first_byte_at is None and int(self.stats.get("bytes") or 0) > 0:
+                self.first_byte_at = time.time()
         # С --backup-dir и удаление, и перезапись — серверный перенос старой копии в _versions.
         if msg.startswith("Moved (server-side)"):
             self.moved += 1
@@ -291,6 +294,12 @@ class LogSummary:
 
     def bytes(self) -> int:
         return int(self.stats.get("bytes") or 0)
+
+    def timing(self, sync_started: float) -> dict:
+        """Где ушло окно: обход до первого байта, проверено файлов, средняя скорость выгрузки."""
+        return {"firstByteSec": int(self.first_byte_at - sync_started) if self.first_byte_at else None,
+                "checks": int(self.stats.get("checks") or 0),
+                "speedBps": int(self.stats.get("speed") or 0)}
 
     def transfers(self) -> int:
         return int(self.stats.get("transfers") or 0)
@@ -424,6 +433,8 @@ def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) 
 
     # Пробный обход не должен съесть окно: на сам sync оставляем не меньше 5 минут.
     pending, dry = count_pending_deletes(remote, filter_file, versions, max(60, max_duration - 300))
+    dry_run_sec = int(time.time() - started)
+    log(f"{remote}: пробный обход {dry_run_sec}s, к удалению {pending}")
     if pending is None:
         status = classify(1, dry)
         if status == "auth_error":
@@ -448,6 +459,7 @@ def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) 
     if BWLIMIT:
         cmd += ["--bwlimit", BWLIMIT]
     log(f"{remote}: sync {', '.join(dirs)} (max {MAX_TRANSFER_GB}G, {max_duration}s)")
+    sync_started = time.time()
     code = -1
     try:
         proc = subprocess.Popen(niced(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -485,7 +497,8 @@ def sync_remote(remote: str, dirs: list[str], max_duration: int, versions: str) 
             "bytesTransferred": summary.bytes(), "filesTransferred": summary.transfers(),
             "movedToVersions": summary.moved_to_versions(), "errors": summary.errors,
             "planBytes": None, "remainingBytes": None, "quota": None,
-            "durationSec": int(time.time() - started)}
+            "durationSec": int(time.time() - started), "dryRunSec": dry_run_sec,
+            **summary.timing(sync_started)}
 
 
 def refresh_du(state: dict, names: list[str], force: bool = False) -> dict:
