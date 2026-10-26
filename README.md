@@ -48,6 +48,22 @@ default `/share/NAS`), same Bearer token as the sync worker:
   Use a dedicated locked-down SSH account on the VPS
   (`permitlisten="127.0.0.1:18125"`, no shell).
 
+## HA Reverse Tunnel (второе дополнение в этом репозитории)
+
+`ha_tunnel/` — отдельное дополнение **HA Reverse Tunnel**: постоянный reverse
+SSH туннель с HA Green на VPS, чтобы `ha.plansolo.ru` и MiWiFi VPN API в
+дашборде работали без включённого Mac.
+
+```text
+127.0.0.1:18123 на VPS → HA 8123          (nginx, бэкенд, home-events)
+127.0.0.1:18124 на VPS → 192.168.31.1:80  (MiWiFi VPN API)
+```
+
+Ключ генерируется на самом HA (`/data/ssh/id_ed25519`), в лог печатается только
+публичная часть (`PUBKEY: …`); на VPS она вносится пользователю `hatunnel`
+скриптом `deploy/setup-ha-tunnel-user.sh` из репозитория DashBoardTrag.
+Подробности — [`ha_tunnel/DOCS.md`](ha_tunnel/DOCS.md).
+
 ## Storage resilience (v0.10.41)
 
 Service processes now refuse to write when the share is not actually mounted.

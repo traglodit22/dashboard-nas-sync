@@ -1,0 +1,32 @@
+name: HA Reverse Tunnel
+version: "1.0.0"
+slug: ha_tunnel
+description: Постоянный reverse SSH туннель с HA Green на VPS (ha.plansolo.ru и MiWiFi VPN API)
+url: https://github.com/traglodit22/dashboard-nas-sync/tree/main/ha_tunnel
+arch:
+  - aarch64
+  - amd64
+startup: system
+boot: auto
+init: false
+host_network: true
+options:
+  ssh_host: "135.106.197.184"
+  ssh_port: 2222
+  ssh_user: hatunnel
+  ha_remote_bind: "127.0.0.1:18123"
+  ha_local: "127.0.0.1:8123"
+  router_remote_bind: "127.0.0.1:18124"
+  router_local: "192.168.31.1:80"
+  server_alive_interval: 15
+  server_alive_count_max: 3
+schema:
+  ssh_host: str
+  ssh_port: port
+  ssh_user: match(^[a-z_][a-z0-9_-]{0,31}$)
+  ha_remote_bind: str
+  ha_local: str
+  router_remote_bind: str
+  router_local: str
+  server_alive_interval: int(5,120)
+  server_alive_count_max: int(1,10)

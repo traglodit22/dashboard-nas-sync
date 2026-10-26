@@ -1,0 +1,106 @@
+#!/usr/bin/with-contenv bash
+# Reverse SSH туннель HA Green → VPS (замена Mac LaunchAgent ru.plansolo.ha-tunnel):
+#   127.0.0.1:18123 на VPS → HA 8123        (nginx ha.plansolo.ru, бэкенд, home-events)
+#   127.0.0.1:18124 на VPS → роутер 192.168.31.1:80 (MiWiFi VPN API)
+#
+# Ключ генерируется здесь, на HA, и живёт в /data (переживает рестарты и обновления
+# дополнения). Приватный ключ не покидает устройство: в лог печатается только
+# публичная часть строкой "PUBKEY: ..." — её вносим в authorized_keys пользователя
+# hatunnel на VPS (deploy/setup-ha-tunnel-user.sh).
+#
+# Почему свой цикл, а не autossh: autossh -M 0 — обёртка ровно над этим циклом
+# (перезапуск ssh при выходе), но при занятом порту он молотит попытки без паузы.
+# Здесь пауза 15 с — как в проверенном archive-sync-tunnel на этом же HA, плюс s6
+# перезапускает сервис, если умрёт сам скрипт.
+set -uo pipefail
+
+OPTIONS=/data/options.json
+SSH_DIR=/data/ssh
+KEY="${SSH_DIR}/id_ed25519"
+KNOWN_HOSTS="${SSH_DIR}/known_hosts"
+RETRY_SECONDS="${RETRY_SECONDS:-15}"
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+opt() { jq -r --arg k "$1" --arg d "$2" '.[$k] // $d' "$OPTIONS"; }
+
+HOST="$(opt ssh_host '135.106.197.184')"
+PORT="$(opt ssh_port 2222)"
+USER_NAME="$(opt ssh_user hatunnel)"
+HA_BIND="$(opt ha_remote_bind '127.0.0.1:18123')"
+HA_LOCAL="$(opt ha_local '127.0.0.1:8123')"
+ROUTER_BIND="$(opt router_remote_bind '127.0.0.1:18124')"
+ROUTER_LOCAL="$(opt router_local '192.168.31.1:80')"
+ALIVE_INT="$(opt server_alive_interval 15)"
+ALIVE_MAX="$(opt server_alive_count_max 3)"
+
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+
+if [[ ! -s "$KEY" ]]; then
+  log "ключа нет — генерирую ed25519 в ${KEY}"
+  ssh-keygen -t ed25519 -N '' -C "ha-tunnel@homeassistant" -f "$KEY" >/dev/null
+fi
+chmod 600 "$KEY"
+
+PUB="$(cat "${KEY}.pub")"
+log "PUBKEY: ${PUB}"
+log "если ключа нет на VPS: bash deploy/setup-ha-tunnel-user.sh '${PUB}'"
+
+probe() { # probe host:port — отвечает ли что-то на TCP
+  local target="$1" host port
+  host="${target%%:*}"
+  port="${target##*:}"
+  nc -z -w 3 "$host" "$port" 2>/dev/null
+}
+
+FORWARDS=()
+log "цель: ${HA_BIND} → ${HA_LOCAL}; ${ROUTER_BIND} → ${ROUTER_LOCAL} через ${USER_NAME}@${HOST}:${PORT}"
+
+while true; do
+  FORWARDS=()
+
+  # HA должен отвечать, иначе туннель бесполезен: ждём до ~60 с (HA core стартует
+  # позже дополнения), но не блокируемся навсегда.
+  ha_ready=0
+  for _ in $(seq 1 12); do
+    if probe "$HA_LOCAL"; then ha_ready=1; break; fi
+    log "жду HA на ${HA_LOCAL}"
+    sleep 5
+  done
+  if [[ "$ha_ready" -ne 1 ]]; then
+    log "HA на ${HA_LOCAL} не отвечает — всё равно поднимаю проброс (оживёт вместе с HA)"
+  fi
+
+  FORWARDS+=(-R "${HA_BIND}:${HA_LOCAL}")
+
+  if probe "$ROUTER_LOCAL"; then
+    FORWARDS+=(-R "${ROUTER_BIND}:${ROUTER_LOCAL}")
+  else
+    log "warn: роутер ${ROUTER_LOCAL} не отвечает — без проброса MiWiFi, повторю на следующей попытке"
+  fi
+
+  log "ssh -N ${FORWARDS[*]}"
+  ssh -N -T \
+    -i "$KEY" \
+    -o IdentitiesOnly=yes \
+    -o BatchMode=yes \
+    -o PreferredAuthentications=publickey \
+    -o StrictHostKeyChecking=accept-new \
+    -o "UserKnownHostsFile=${KNOWN_HOSTS}" \
+    -o "ServerAliveInterval=${ALIVE_INT}" \
+    -o "ServerAliveCountMax=${ALIVE_MAX}" \
+    -o TCPKeepAlive=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ConnectTimeout=15 \
+    -p "$PORT" \
+    "${FORWARDS[@]}" \
+    "${USER_NAME}@${HOST}"
+  rc=$?
+
+  case "$rc" in
+    255) log "ssh вышел (255): обычно нет ключа в authorized_keys, занят порт на VPS или сеть — ретрай через ${RETRY_SECONDS}с" ;;
+    *)   log "ssh вышел (${rc}) — ретрай через ${RETRY_SECONDS}с" ;;
+  esac
+  sleep "$RETRY_SECONDS"
+done
