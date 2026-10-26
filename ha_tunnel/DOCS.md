@@ -72,10 +72,14 @@ ha apps restart 3076975b_ha_tunnel
 Проверка после обновления: `ha apps logs 3076975b_ha_tunnel | tail` — строка
 `ssh -N -R ...` без `Permission denied` / `remote port forwarding failed`.
 
-`boot: auto` — туннель поднимается сам после перезагрузки HA OS;
-`watchdog: true` — Supervisor перезапускает дополнение, если контейнер умер.
-Здоровье самого туннеля (а не контейнера) стережёт watchdog на VPS:
-`systemctl status ha-tunnel-watchdog.timer` (из `deploy/setup-ha-tunnel-user.sh`).
+`boot: auto` — туннель поднимается сам после перезагрузки HA OS. Здоровье самого
+туннеля (а не контейнера) стережёт watchdog на VPS:
+`systemctl status ha-tunnel-watchdog.timer` (ставится
+`deploy/setup-ha-tunnel-user.sh` из репозитория DashBoardTrag).
+
+Ключ `watchdog:` в `config.yaml` **не добавлять**: в Supervisor 2026.10.3 это URL
+health-check (`watchdog: "tcp://[HOST]:8123"`), а не boolean — с boolean-значением
+Supervisor пишет `Can't read …/config.yaml` и дополнение исчезает из магазина.
 
 ## Логи
 

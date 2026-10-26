@@ -9,9 +9,11 @@ arch:
 startup: system
 boot: auto
 init: false
-# Supervisor перезапускает дополнение, если контейнер умер: без этого туннель
-# лежал бы до ручного вмешательства — ровно та тишина, из-за которой переезжали.
-watchdog: true
+# Без `watchdog:` намеренно. В Supervisor 2026.10.3 этот ключ — URL health-check
+# (watchdog: "tcp://[HOST]:8123"), а не boolean; boolean-значение ломает парсинг
+# config.yaml и дополнение пропадает из магазина. Health-check на 8123 тоже не
+# нужен: падение HA core не означает проблему туннеля. Живучесть держат s6
+# (перезапуск сервиса) и watchdog на VPS (проверка реального ответа туннеля).
 host_network: true
 options:
   ssh_host: "135.106.197.184"
