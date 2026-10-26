@@ -58,6 +58,25 @@ HA Green ──ssh -R──▶ VPS 135.106.197.184
 порту она молотит попытки без паузы. Здесь обычный `ssh` в цикле с паузой 15 с,
 а s6-overlay перезапускает сам сервис, если умрёт скрипт.
 
+## Обновление (важно)
+
+Дополнение собирается **локально на устройстве** (GitHub Release не публикуется),
+поэтому после `git push` в этот репозиторий HA не подхватит код сам:
+
+```bash
+ha store reload
+ha apps rebuild 3076975b_ha_tunnel   # пересборка образа из нового кода
+ha apps restart 3076975b_ha_tunnel
+```
+
+Проверка после обновления: `ha apps logs 3076975b_ha_tunnel | tail` — строка
+`ssh -N -R ...` без `Permission denied` / `remote port forwarding failed`.
+
+`boot: auto` — туннель поднимается сам после перезагрузки HA OS;
+`watchdog: true` — Supervisor перезапускает дополнение, если контейнер умер.
+Здоровье самого туннеля (а не контейнера) стережёт watchdog на VPS:
+`systemctl status ha-tunnel-watchdog.timer` (из `deploy/setup-ha-tunnel-user.sh`).
+
 ## Логи
 
 ```bash

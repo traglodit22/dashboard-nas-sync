@@ -1,5 +1,5 @@
 name: HA Reverse Tunnel
-version: "1.0.0"
+version: "1.1.0"
 slug: ha_tunnel
 description: Постоянный reverse SSH туннель с HA Green на VPS (ha.plansolo.ru и MiWiFi VPN API)
 url: https://github.com/traglodit22/dashboard-nas-sync/tree/main/ha_tunnel
@@ -9,6 +9,9 @@ arch:
 startup: system
 boot: auto
 init: false
+# Supervisor перезапускает дополнение, если контейнер умер: без этого туннель
+# лежал бы до ручного вмешательства — ровно та тишина, из-за которой переезжали.
+watchdog: true
 host_network: true
 options:
   ssh_host: "135.106.197.184"
